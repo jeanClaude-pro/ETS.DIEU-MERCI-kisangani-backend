@@ -15,6 +15,7 @@ router.get("/current", async (req, res) => {
     }
 
     res.json({
+      _id: currentRate._id,
       rate: currentRate.rate,
       effectiveFrom: currentRate.effectiveFrom,
       lastUpdated: currentRate.updatedAt,

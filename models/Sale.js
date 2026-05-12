@@ -176,6 +176,22 @@ const saleSchema = new mongoose.Schema({
     },
     reason: String
   }],
+  // Snapshot of the exchange rate at the time the sale was recorded
+  exchangeRateSnapshot: {
+    rateId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "ExchangeRate",
+      required: false
+    },
+    rate: {
+      type: Number,
+      required: false
+    },
+    effectiveFrom: {
+      type: Date,
+      required: false
+    }
+  },
 }, {
   timestamps: true
 });

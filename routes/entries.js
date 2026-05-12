@@ -6,126 +6,103 @@ const authMiddleware = require("../middleware/auth");
 
 // ==================== TIME FRAME HELPER FUNCTIONS ====================
 
-/**
- * Parse date string and set appropriate time boundaries
- * @param {string} dateStr - Date in YYYY-MM-DD format
- * @param {boolean} isEndDate - If true, sets to end of day (23:59:59.999)
- * @returns {Date} Parsed date object
- */
+// Kisangani (DRC) is permanently UTC+2 — no daylight saving time
+const KIS_OFFSET = '+02:00';
+
+function getTodayKisangani() {
+  const now = new Date();
+  const local = new Date(now.getTime() + 2 * 60 * 60 * 1000);
+  return local.toISOString().split('T')[0];
+}
+
 function parseDate(dateStr, isEndDate = false) {
   if (!dateStr) return null;
-  
-  const date = new Date(dateStr);
-  if (isNaN(date.getTime())) {
+
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
     throw new Error(`Invalid date format: ${dateStr}. Use YYYY-MM-DD format.`);
   }
-  
-  if (isEndDate) {
-    date.setHours(23, 59, 59, 999);
-  } else {
-    date.setHours(0, 0, 0, 0);
+
+  const time = isEndDate ? '23:59:59.999' : '00:00:00.000';
+  const date = new Date(`${dateStr}T${time}${KIS_OFFSET}`);
+
+  if (isNaN(date.getTime())) {
+    throw new Error(`Invalid date: ${dateStr}`);
   }
-  
+
   return date;
 }
 
-/**
- * Build date range filter based on timeframe parameters
- * Follows priority: custom range > specific day > month > year > today
- * @param {Object} query - Request query parameters
- * @returns {Object} MongoDB date filter { createdAt: { $gte, $lte } }
- */
 function buildTimeframeFilter(query) {
   const { from, to, date, year, month } = query;
-  
-  // Priority 1: Custom date range (from and to)
+
+  // Priority 1: Custom date range
   if (from || to) {
-    const startDate = from ? parseDate(from, false) : new Date(0); // Beginning of time
-    const endDate = to ? parseDate(to, true) : new Date(); // Current date/time
-    
+    const startDate = from ? parseDate(from, false) : new Date(0);
+    const endDate = to ? parseDate(to, true) : new Date();
+
     if (from && to && startDate > endDate) {
       throw new Error("Start date (from) must be before or equal to end date (to)");
     }
-    
-    return {
-      createdAt: {
-        $gte: startDate,
-        $lte: endDate
-      }
-    };
+
+    return { createdAt: { $gte: startDate, $lte: endDate } };
   }
-  
+
   // Priority 2: Specific day
   if (date) {
-    const dayDate = parseDate(date, false);
-    const startDate = new Date(dayDate);
-    const endDate = new Date(dayDate);
-    endDate.setHours(23, 59, 59, 999);
-    
     return {
       createdAt: {
-        $gte: startDate,
-        $lte: endDate
+        $gte: parseDate(date, false),
+        $lte: parseDate(date, true)
       }
     };
   }
-  
+
   // Priority 3: Specific month
   if (year && month) {
     const yearNum = parseInt(year, 10);
-    const monthNum = parseInt(month, 10) - 1; // JS months are 0-indexed
-    
+    const monthNum = parseInt(month, 10); // 1-indexed
+
     if (isNaN(yearNum) || yearNum < 2000 || yearNum > 2100) {
       throw new Error(`Invalid year: ${year}. Must be between 2000-2100.`);
     }
-    
-    if (isNaN(monthNum) || monthNum < 0 || monthNum > 11) {
+    if (isNaN(monthNum) || monthNum < 1 || monthNum > 12) {
       throw new Error(`Invalid month: ${month}. Must be between 01-12.`);
     }
-    
-    const startDate = new Date(yearNum, monthNum, 1);
-    const endDate = new Date(yearNum, monthNum + 1, 0); // Last day of month
-    endDate.setHours(23, 59, 59, 999);
-    
+
+    const mm = String(monthNum).padStart(2, '0');
+    const lastDay = new Date(yearNum, monthNum, 0).getDate();
+    const dd = String(lastDay).padStart(2, '0');
+
     return {
       createdAt: {
-        $gte: startDate,
-        $lte: endDate
+        $gte: new Date(`${yearNum}-${mm}-01T00:00:00.000${KIS_OFFSET}`),
+        $lte: new Date(`${yearNum}-${mm}-${dd}T23:59:59.999${KIS_OFFSET}`)
       }
     };
   }
-  
+
   // Priority 4: Full year
   if (year) {
     const yearNum = parseInt(year, 10);
-    
+
     if (isNaN(yearNum) || yearNum < 2000 || yearNum > 2100) {
       throw new Error(`Invalid year: ${year}. Must be between 2000-2100.`);
     }
-    
-    const startDate = new Date(yearNum, 0, 1); // Jan 1
-    const endDate = new Date(yearNum, 11, 31); // Dec 31
-    endDate.setHours(23, 59, 59, 999);
-    
+
     return {
       createdAt: {
-        $gte: startDate,
-        $lte: endDate
+        $gte: new Date(`${yearNum}-01-01T00:00:00.000${KIS_OFFSET}`),
+        $lte: new Date(`${yearNum}-12-31T23:59:59.999${KIS_OFFSET}`)
       }
     };
   }
-  
-  // Priority 5: Default to today
-  const today = new Date();
-  const startDate = new Date(today);
-  startDate.setHours(0, 0, 0, 0);
-  const endDate = new Date(today);
-  endDate.setHours(23, 59, 59, 999);
-  
+
+  // Priority 5: Default to today in Kisangani time
+  const todayStr = getTodayKisangani();
   return {
     createdAt: {
-      $gte: startDate,
-      $lte: endDate
+      $gte: new Date(`${todayStr}T00:00:00.000${KIS_OFFSET}`),
+      $lte: new Date(`${todayStr}T23:59:59.999${KIS_OFFSET}`)
     }
   };
 }
@@ -684,11 +661,9 @@ router.patch("/:id/restore", authMiddleware, async (req, res) => {
 router.get("/stats/daily", authMiddleware, async (req, res) => {
   try {
     const { date } = req.query;
-    const targetDate = date ? new Date(date) : new Date();
-    const startOfDay = new Date(targetDate);
-    startOfDay.setHours(0, 0, 0, 0);
-    const endOfDay = new Date(targetDate);
-    endOfDay.setHours(23, 59, 59, 999);
+    const dateStr = date || getTodayKisangani();
+    const startOfDay = new Date(`${dateStr}T00:00:00.000${KIS_OFFSET}`);
+    const endOfDay = new Date(`${dateStr}T23:59:59.999${KIS_OFFSET}`);
 
     const dailyEntries = await Entry.aggregate([
       {

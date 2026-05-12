@@ -99,26 +99,36 @@ async function recalculateCustomerStats(customerId) {
 
 // ==================== TIME FRAME HELPER FUNCTIONS ====================
 
+// Kisangani (DRC) is permanently UTC+2 — no daylight saving time
+const KIS_OFFSET = '+02:00';
+
 /**
- * Parse date string and set appropriate time boundaries
- * @param {string} dateStr - Date in YYYY-MM-DD format
- * @param {boolean} isEndDate - If true, sets to end of day (23:59:59.999)
- * @returns {Date} Parsed date object
+ * Returns today's date string (YYYY-MM-DD) in Kisangani local time (UTC+2).
+ */
+function getTodayKisangani() {
+  const now = new Date();
+  const local = new Date(now.getTime() + 2 * 60 * 60 * 1000);
+  return local.toISOString().split('T')[0];
+}
+
+/**
+ * Parse a YYYY-MM-DD string into a Date whose boundary (start or end of day)
+ * is expressed in Kisangani local time (UTC+2), regardless of server timezone.
  */
 function parseDate(dateStr, isEndDate = false) {
   if (!dateStr) return null;
-  
-  const date = new Date(dateStr);
-  if (isNaN(date.getTime())) {
+
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
     throw new Error(`Invalid date format: ${dateStr}. Use YYYY-MM-DD format.`);
   }
-  
-  if (isEndDate) {
-    date.setHours(23, 59, 59, 999);
-  } else {
-    date.setHours(0, 0, 0, 0);
+
+  const time = isEndDate ? '23:59:59.999' : '00:00:00.000';
+  const date = new Date(`${dateStr}T${time}${KIS_OFFSET}`);
+
+  if (isNaN(date.getTime())) {
+    throw new Error(`Invalid date: ${dateStr}`);
   }
-  
+
   return date;
 }
 
@@ -150,75 +160,60 @@ function buildTimeframeFilter(query) {
   
   // Priority 2: Specific day
   if (date) {
-    const dayDate = parseDate(date, false);
-    const startDate = new Date(dayDate);
-    const endDate = new Date(dayDate);
-    endDate.setHours(23, 59, 59, 999);
-    
     return {
       createdAt: {
-        $gte: startDate,
-        $lte: endDate
+        $gte: parseDate(date, false),
+        $lte: parseDate(date, true)
       }
     };
   }
-  
+
   // Priority 3: Specific month
   if (year && month) {
     const yearNum = parseInt(year, 10);
-    const monthNum = parseInt(month, 10) - 1; // JS months are 0-indexed
-    
+    const monthNum = parseInt(month, 10); // 1-indexed (1=Jan … 12=Dec)
+
     if (isNaN(yearNum) || yearNum < 2000 || yearNum > 2100) {
       throw new Error(`Invalid year: ${year}. Must be between 2000-2100.`);
     }
-    
-    if (isNaN(monthNum) || monthNum < 0 || monthNum > 11) {
+    if (isNaN(monthNum) || monthNum < 1 || monthNum > 12) {
       throw new Error(`Invalid month: ${month}. Must be between 01-12.`);
     }
-    
-    const startDate = new Date(yearNum, monthNum, 1);
-    const endDate = new Date(yearNum, monthNum + 1, 0); // Last day of month
-    endDate.setHours(23, 59, 59, 999);
-    
+
+    const mm = String(monthNum).padStart(2, '0');
+    const lastDay = new Date(yearNum, monthNum, 0).getDate(); // day 0 of next month
+    const dd = String(lastDay).padStart(2, '0');
+
     return {
       createdAt: {
-        $gte: startDate,
-        $lte: endDate
+        $gte: new Date(`${yearNum}-${mm}-01T00:00:00.000${KIS_OFFSET}`),
+        $lte: new Date(`${yearNum}-${mm}-${dd}T23:59:59.999${KIS_OFFSET}`)
       }
     };
   }
-  
+
   // Priority 4: Full year
   if (year) {
     const yearNum = parseInt(year, 10);
-    
+
     if (isNaN(yearNum) || yearNum < 2000 || yearNum > 2100) {
       throw new Error(`Invalid year: ${year}. Must be between 2000-2100.`);
     }
-    
-    const startDate = new Date(yearNum, 0, 1); // Jan 1
-    const endDate = new Date(yearNum, 11, 31); // Dec 31
-    endDate.setHours(23, 59, 59, 999);
-    
+
     return {
       createdAt: {
-        $gte: startDate,
-        $lte: endDate
+        $gte: new Date(`${yearNum}-01-01T00:00:00.000${KIS_OFFSET}`),
+        $lte: new Date(`${yearNum}-12-31T23:59:59.999${KIS_OFFSET}`)
       }
     };
   }
-  
-  // Priority 5: Default to today
-  const today = new Date();
-  const startDate = new Date(today);
-  startDate.setHours(0, 0, 0, 0);
-  const endDate = new Date(today);
-  endDate.setHours(23, 59, 59, 999);
-  
+
+  // Priority 5: Default to today in Kisangani time
+  const todayStr = getTodayKisangani();
   return {
     createdAt: {
-      $gte: startDate,
-      $lte: endDate
+      $gte: new Date(`${todayStr}T00:00:00.000${KIS_OFFSET}`),
+      $lte: new Date(`${todayStr}T23:59:59.999${KIS_OFFSET}`)
     }
   };
 }
@@ -392,11 +387,9 @@ router.get("/", authMiddleware, async (req, res) => {
 router.get("/stats/daily", authMiddleware, async (req, res) => {
   try {
     const { date } = req.query;
-    const targetDate = date ? new Date(date) : new Date();
-    const startOfDay = new Date(targetDate);
-    startOfDay.setHours(0, 0, 0, 0);
-    const endOfDay = new Date(targetDate);
-    endOfDay.setHours(23, 59, 59, 999);
+    const dateStr = date || getTodayKisangani();
+    const startOfDay = new Date(`${dateStr}T00:00:00.000${KIS_OFFSET}`);
+    const endOfDay = new Date(`${dateStr}T23:59:59.999${KIS_OFFSET}`);
 
     const dailySales = await Sale.aggregate([
       {
@@ -444,15 +437,16 @@ router.get("/stats/daily", authMiddleware, async (req, res) => {
 /** ---------- CREATE SALE OR EXPENSE ---------- **/
 router.post("/", authMiddleware, async (req, res) => {
   try {
-    const { 
-      customer, 
-      items, 
-      paymentMethod, 
-      salesPerson, 
-      type, 
-      reservationDate, 
-      reservationTime, 
+    const {
+      customer,
+      items,
+      paymentMethod,
+      salesPerson,
+      type,
+      reservationDate,
+      reservationTime,
       notes,
+      exchangeRateSnapshot,
       // 🔹 NEW EXPENSE FIELDS
       reason,
       recipientName,
@@ -513,11 +507,8 @@ router.post("/", authMiddleware, async (req, res) => {
     }
 
     // 🔹 HANDLE REGULAR SALE (existing logic)
-    if (!customer || !customer.name || !customer.phone) {
-      return res
-        .status(400)
-        .json({ error: "Customer name and phone are required" });
-    }
+    // Customer info is optional — a sale can be made without client details
+    const safeCustomer = customer || {};
     if (!items || !Array.isArray(items) || items.length === 0) {
       return res
         .status(400)
@@ -568,17 +559,19 @@ router.post("/", authMiddleware, async (req, res) => {
 
     const saleNumber = `SN-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
 
-    // FIX: Get customer ID from updateCustomerData and set customerId
-    const customerId = await updateCustomerData(customer, total);
+    // Only link to a customer record when phone is provided
+    const customerId = safeCustomer.phone
+      ? await updateCustomerData(safeCustomer, total)
+      : null;
 
     // UPDATED: Include type and reservation fields WITH CORRECT STATUS
     const saleData = {
       saleId,
       saleNumber,
       customer: {
-        name: customer.name,
-        phone: customer.phone,
-        email: customer.email || "",
+        name: safeCustomer.name || "",
+        phone: safeCustomer.phone || "",
+        email: safeCustomer.email || "",
       },
       customerId: customerId,
       items: enrichedItems,
@@ -590,7 +583,16 @@ router.post("/", authMiddleware, async (req, res) => {
       type: type || "sale",
       reservationDate: reservationDate || null,
       reservationTime: reservationTime || null,
-      notes: notes || ""
+      notes: notes || "",
+      ...(exchangeRateSnapshot && {
+        exchangeRateSnapshot: {
+          rateId: exchangeRateSnapshot.rateId || null,
+          rate: exchangeRateSnapshot.rate || null,
+          effectiveFrom: exchangeRateSnapshot.effectiveFrom
+            ? new Date(exchangeRateSnapshot.effectiveFrom)
+            : null,
+        }
+      })
     };
 
     for (const it of enrichedItems) {
