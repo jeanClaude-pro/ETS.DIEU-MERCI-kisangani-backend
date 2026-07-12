@@ -25,6 +25,16 @@ const saleItemSchema = new mongoose.Schema({
     required: false, // Made optional for expenses
     min: 0
   },
+  region: {
+    type: String,
+    enum: ["Butembo", "China"],
+    required: false
+  },
+  regionCode: {
+    type: String,
+    enum: ["Bbbb", "Cnnn"],
+    required: false
+  },
 });
 
 const saleSchema = new mongoose.Schema({

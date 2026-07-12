@@ -33,6 +33,16 @@ const entrySchema = new mongoose.Schema({
     trim: true,
     default: ""
   },
+  region: {
+    type: String,
+    enum: ["Butembo", "China"],
+    required: false
+  },
+  regionCode: {
+    type: String,
+    enum: ["Bbbb", "Cnnn"],
+    required: false
+  },
   // Who the money was received from (like your customer object)
   receivedFrom: {
     name: {

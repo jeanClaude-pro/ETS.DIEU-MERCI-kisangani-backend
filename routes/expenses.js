@@ -3,6 +3,7 @@ const router = express.Router();
 const Expense = require("../models/Expense");
 const authMiddleware = require("../middleware/auth");
 const nodemailer = require("nodemailer");
+const { isValidRegionPair } = require("../utils/regions");
 
 // ✅ CREATE EMAIL TRANSPORTER
 const transporter = nodemailer.createTransport({
@@ -396,11 +397,12 @@ function isAdminUser(user) {
  */
 router.get("/", authMiddleware, async (req, res) => {
   try {
-    const { 
-      status, 
-      paymentMethod, 
+    const {
+      status,
+      paymentMethod,
       search,
-      recordedBy
+      recordedBy,
+      region
     } = req.query;
     
     // Build the main filter object
@@ -450,6 +452,11 @@ router.get("/", authMiddleware, async (req, res) => {
         { expenseId: { $regex: search, $options: "i" } },
         { recipientPhone: { $regex: search, $options: "i" } }
       ];
+    }
+
+    // 6. Apply region filter if provided
+    if (region) {
+      filter.regionCode = region;
     }
 
     // Execute query - get ALL records within timeframe (no skip/limit)
@@ -527,7 +534,8 @@ router.get("/", authMiddleware, async (req, res) => {
         status: status || 'default (all statuses)',
         paymentMethod: paymentMethod || 'none',
         recordedBy: recordedBy || 'none',
-        search: search || 'none'
+        search: search || 'none',
+        region: region || 'all'
       },
       // Performance warning for large datasets
       performanceNote: total > 1000 
@@ -567,19 +575,25 @@ router.get("/", authMiddleware, async (req, res) => {
 /** ---------- CREATE EXPENSE ---------- **/
 router.post("/", authMiddleware, async (req, res) => {
   try {
-    const { reason, recipientName, recipientPhone, amount, paymentMethod, notes, recordedBy } = req.body;
+    const { reason, recipientName, recipientPhone, amount, paymentMethod, notes, recordedBy, region, regionCode } = req.body;
 
     // Validation
     if (!reason || !recipientName || !recipientPhone || !amount) {
-      return res.status(400).json({ 
-        error: "Reason, recipientName, recipientPhone, and amount are required" 
+      return res.status(400).json({
+        error: "Reason, recipientName, recipientPhone, and amount are required"
+      });
+    }
+
+    if (!region || !regionCode || !isValidRegionPair(region, regionCode)) {
+      return res.status(400).json({
+        error: "A valid region (Butembo/China) is required",
       });
     }
 
     const expenseAmount = parseFloat(amount);
     if (isNaN(expenseAmount) || expenseAmount <= 0) {
-      return res.status(400).json({ 
-        error: "Amount must be a positive number" 
+      return res.status(400).json({
+        error: "Amount must be a positive number"
       });
     }
 
@@ -607,7 +621,9 @@ router.post("/", authMiddleware, async (req, res) => {
       paymentMethod: normalizedPM,
       recordedBy: sanitizedRecordedBy,
       notes: sanitizedNotes,
-      status: "pending"
+      status: "pending",
+      region,
+      regionCode
     };
 
     const expense = new Expense(expenseData);
@@ -748,12 +764,19 @@ router.patch("/:id/reject", authMiddleware, async (req, res) => {
 /** ---------- UPDATE EXPENSE (ENHANCED FOR ALL STATUSES WITH ADMIN CHECK) ---------- **/
 router.put("/:id", authMiddleware, async (req, res) => {
   try {
-    const { reason, recipientName, recipientPhone, amount, paymentMethod, notes, updateReason } = req.body;
+    const { reason, recipientName, recipientPhone, amount, paymentMethod, notes, updateReason, region, regionCode } = req.body;
 
     // Validation
     if (!reason || !recipientName || !recipientPhone || !amount) {
-      return res.status(400).json({ 
-        error: "Reason, recipientName, recipientPhone, and amount are required" 
+      return res.status(400).json({
+        error: "Reason, recipientName, recipientPhone, and amount are required"
+      });
+    }
+
+    if ((region !== undefined || regionCode !== undefined) &&
+        !isValidRegionPair(region, regionCode)) {
+      return res.status(400).json({
+        error: "A valid region (Butembo/China) is required",
       });
     }
 
@@ -814,6 +837,9 @@ router.put("/:id", authMiddleware, async (req, res) => {
       paymentMethod: normalizedPM,
       updatedAt: new Date()
     };
+
+    if (region !== undefined) updateData.region = region;
+    if (regionCode !== undefined) updateData.regionCode = regionCode;
 
     // Add notes with update history
     const updateNote = sanitizedUpdateReason ? 

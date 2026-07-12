@@ -3,12 +3,13 @@ const router = express.Router();
 const Product = require("../models/Product");
 const authMiddleware = require("../middleware/auth");
 const isAdmin = require("../middleware/isAdmin");
+const { isValidRegionPair } = require("../utils/regions");
 
 // GET /api/products - Get all products with optional filtering
 router.get("/", async (req, res) => {
   console.log("Fetching products with filters:", req.query);
   try {
-    const { search, category, status } = req.query;
+    const { search, category, status, region } = req.query;
 
     // Build filter object
     const filter = {};
@@ -23,6 +24,10 @@ router.get("/", async (req, res) => {
 
     if (status) {
       filter.status = status;
+    }
+
+    if (region) {
+      filter.regionCode = region;
     }
 
     const products = await Product.find(filter).sort({ createdAt: -1 });
@@ -67,12 +72,20 @@ router.post("/", authMiddleware, isAdmin, async (req, res) => {
       unit,
       weight,
       status,
+      region,
+      regionCode,
     } = req.body;
 
     // Validate required fields
     if (!name || !category) {
       return res.status(400).json({
         error: "Name and category are required fields",
+      });
+    }
+
+    if (!region || !regionCode || !isValidRegionPair(region, regionCode)) {
+      return res.status(400).json({
+        error: "A valid region (Butembo/China) is required",
       });
     }
 
@@ -86,6 +99,8 @@ router.post("/", authMiddleware, isAdmin, async (req, res) => {
       unit: unit || "pcs",
       weight: Number(weight) || 0,
       status: status || "active",
+      region,
+      regionCode,
     });
 
     const savedProduct = await product.save();
@@ -115,7 +130,16 @@ router.put("/:id", authMiddleware, isAdmin, async (req, res) => {
       unit,
       weight,
       status,
+      region,
+      regionCode,
     } = req.body;
+
+    if ((region !== undefined || regionCode !== undefined) &&
+        !isValidRegionPair(region, regionCode)) {
+      return res.status(400).json({
+        error: "A valid region (Butembo/China) is required",
+      });
+    }
 
     // Build update object with only provided fields
     const updateData = {};
@@ -129,6 +153,8 @@ router.put("/:id", authMiddleware, isAdmin, async (req, res) => {
     if (unit !== undefined) updateData.unit = unit;
     if (weight !== undefined) updateData.weight = Number(weight);
     if (status !== undefined) updateData.status = status;
+    if (region !== undefined) updateData.region = region;
+    if (regionCode !== undefined) updateData.regionCode = regionCode;
 
     const updatedProduct = await Product.findByIdAndUpdate(
       req.params.id,

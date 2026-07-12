@@ -52,6 +52,16 @@ const expenseSchema = new mongoose.Schema({
   notes: {
     type: String,
     default: ""
+  },
+  region: {
+    type: String,
+    enum: ["Butembo", "China"],
+    required: false
+  },
+  regionCode: {
+    type: String,
+    enum: ["Bbbb", "Cnnn"],
+    required: false
   }
 }, {
   timestamps: true

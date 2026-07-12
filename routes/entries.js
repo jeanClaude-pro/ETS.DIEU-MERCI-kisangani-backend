@@ -3,6 +3,7 @@ const router = express.Router();
 const mongoose = require("mongoose");
 const Entry = require("../models/Entry");
 const authMiddleware = require("../middleware/auth");
+const { isValidRegionPair } = require("../utils/regions");
 
 // ==================== TIME FRAME HELPER FUNCTIONS ====================
 
@@ -150,12 +151,13 @@ function normalizePaymentMethod(pm) {
  */
 router.get("/", authMiddleware, async (req, res) => {
   try {
-    const { 
+    const {
       category,
       source,
       status,
       search,
-      createdBy
+      createdBy,
+      region
     } = req.query;
     
     // Build the main filter object
@@ -210,6 +212,11 @@ router.get("/", authMiddleware, async (req, res) => {
         { category: { $regex: search, $options: "i" } },
         { description: { $regex: search, $options: "i" } }
       ];
+    }
+
+    // 7. Apply region filter if provided
+    if (region) {
+      filter.regionCode = region;
     }
 
     // Execute query - get ALL records within timeframe (no skip/limit)
@@ -294,7 +301,8 @@ router.get("/", authMiddleware, async (req, res) => {
         category: category || 'none',
         source: source || 'none',
         createdBy: createdBy || 'none',
-        search: search || 'none'
+        search: search || 'none',
+        region: region || 'all'
       },
       // Performance warning for large datasets
       performanceNote: total > 1000 
@@ -334,29 +342,36 @@ router.get("/", authMiddleware, async (req, res) => {
 /** ---------- CREATE ENTRY (Everyone can create) ---------- */
 router.post("/", authMiddleware, async (req, res) => {
   try {
-    const { 
-      amount, 
-      source, 
-      paymentMethod, 
-      category, 
+    const {
+      amount,
+      source,
+      paymentMethod,
+      category,
       description,
-      receivedFrom 
+      receivedFrom,
+      region,
+      regionCode
     } = req.body;
 
     // Validation (like your sale validation)
     if (!amount || amount <= 0) {
-      return res.status(400).json({ 
-        error: "Amount is required and must be positive" 
+      return res.status(400).json({
+        error: "Amount is required and must be positive"
       });
     }
     if (!source) {
-      return res.status(400).json({ 
-        error: "Source is required" 
+      return res.status(400).json({
+        error: "Source is required"
       });
     }
     if (!category) {
-      return res.status(400).json({ 
-        error: "Category is required" 
+      return res.status(400).json({
+        error: "Category is required"
+      });
+    }
+    if (!region || !regionCode || !isValidRegionPair(region, regionCode)) {
+      return res.status(400).json({
+        error: "A valid region (Butembo/China) is required",
       });
     }
 
@@ -377,7 +392,9 @@ router.post("/", authMiddleware, async (req, res) => {
       category: category.trim(),
       description: description ? description.trim() : "",
       receivedFrom: receivedFrom || {},
-      createdBy: req.user.userId
+      createdBy: req.user.userId,
+      region,
+      regionCode
     };
 
     const entry = new Entry(entryData);
@@ -429,15 +446,24 @@ router.put("/:id", authMiddleware, async (req, res) => {
     }
 
     const { id } = req.params;
-    const { 
-      amount, 
-      source, 
-      paymentMethod, 
-      category, 
+    const {
+      amount,
+      source,
+      paymentMethod,
+      category,
       description,
       receivedFrom,
-      reason 
+      reason,
+      region,
+      regionCode
     } = req.body;
+
+    if ((region !== undefined || regionCode !== undefined) &&
+        !isValidRegionPair(region, regionCode)) {
+      return res.status(400).json({
+        error: "A valid region (Butembo/China) is required",
+      });
+    }
 
     // Validate required fields for edit
     if (!amount || amount <= 0) {
@@ -534,6 +560,8 @@ router.put("/:id", authMiddleware, async (req, res) => {
         description: description ? description.trim() : "",
         receivedFrom: receivedFrom || {},
         updatedBy: req.user.userId,
+        ...(region !== undefined && { region }),
+        ...(regionCode !== undefined && { regionCode }),
         $push: {
           editHistory: {
             editedBy: req.user.userId,

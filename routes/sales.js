@@ -248,12 +248,13 @@ function getTimeframeDescription(query) {
  */
 router.get("/", authMiddleware, async (req, res) => {
   try {
-    const { 
-      customerPhone, 
+    const {
+      customerPhone,
       status,
-      type
+      type,
+      region
     } = req.query;
-    
+
     // Build the main filter object
     const filter = {};
     
@@ -288,7 +289,12 @@ router.get("/", authMiddleware, async (req, res) => {
       // Default: include all types
       filter.type = { $in: ["sale", "reservation", "expense"] };
     }
-    
+
+    // 5. Apply region filter if provided (matches any item in that region)
+    if (region) {
+      filter["items.regionCode"] = region;
+    }
+
     // Execute query - get ALL records within timeframe (no skip/limit)
     const sales = await Sale.find(filter)
       .select('-__v') // Exclude version key
@@ -346,7 +352,8 @@ router.get("/", authMiddleware, async (req, res) => {
       filtersApplied: {
         customerPhone: customerPhone || 'none',
         status: status || 'default (completed, pending, expense)',
-        type: type || 'default (sale, reservation, expense)'
+        type: type || 'default (sale, reservation, expense)',
+        region: region || 'all'
       },
       // Performance warning for large datasets
       performanceNote: total > 1000 
@@ -539,6 +546,12 @@ router.post("/", authMiddleware, async (req, res) => {
         });
       }
 
+      if (!product.region || !product.regionCode) {
+        return res.status(400).json({
+          error: `Product "${product.name || productId}" has no region assigned. Contact an administrator.`,
+        });
+      }
+
       const lineTotal = Number(price) * Number(quantity);
       subtotal += lineTotal;
 
@@ -548,6 +561,8 @@ router.post("/", authMiddleware, async (req, res) => {
         quantity: Number(quantity),
         price: Number(price),
         total: lineTotal,
+        region: product.region,
+        regionCode: product.regionCode,
       });
     }
 
@@ -677,28 +692,33 @@ router.get("/expenses/all", authMiddleware, async (req, res) => {
 /** ---------- GET RESERVATIONS (TIME FRAME BASED) ---------- **/
 router.get("/reservations/all", authMiddleware, async (req, res) => {
   try {
-    const { 
-      status 
+    const {
+      status,
+      region
     } = req.query;
-    
+
     // Build timeframe filter
     let timeframeFilter;
     try {
       timeframeFilter = buildTimeframeFilter(req.query);
     } catch (timeframeError) {
-      return res.status(400).json({ 
+      return res.status(400).json({
         error: timeframeError.message,
         suggestion: "Use valid date formats: YYYY-MM-DD"
       });
     }
-    
-    const filter = { 
+
+    const filter = {
       type: "reservation",
       ...timeframeFilter
     };
-    
+
     if (status) {
       filter.status = status;
+    }
+
+    if (region) {
+      filter["items.regionCode"] = region;
     }
 
     const reservations = await Sale.find(filter)
@@ -919,6 +939,8 @@ router.put("/:id", authMiddleware, async (req, res) => {
         quantity: Number(quantity),
         price: Number(price),
         total: lineTotal,
+        region: product.region,
+        regionCode: product.regionCode,
       });
     }
 

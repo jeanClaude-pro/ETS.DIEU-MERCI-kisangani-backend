@@ -34,11 +34,26 @@ app.get("/", (req, res) => {
   res.send("ERP/POS System Backend is running...");
 });
 
+// ====== One-time backfill: legacy products predate the region field ======
+// All pre-existing products are known to have shipped from China, so this
+// assigns them automatically instead of blocking sales behind a manual prompt.
+async function backfillProductRegions() {
+  const Product = require("./models/Product");
+  const { modifiedCount } = await Product.updateMany(
+    { region: { $exists: false } },
+    { $set: { region: "China", regionCode: "Cnnn" } }
+  );
+  if (modifiedCount) {
+    console.log(`🌍 Backfilled region for ${modifiedCount} legacy product(s) -> China`);
+  }
+}
+
 // ====== DB + Server Startup ======
 mongoose
   .connect(MONGO_URI)
-  .then(() => {
+  .then(async () => {
     console.log("✅ Connected to MongoDB Atlas");
+    await backfillProductRegions();
     app.listen(PORT, () => {
       console.log(`🚀 Server running on port ${PORT}`);
     });

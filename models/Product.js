@@ -1,4 +1,5 @@
 const mongoose = require("mongoose");
+const { isValidRegionPair } = require("../utils/regions");
 
 const productSchema = new mongoose.Schema(
   {
@@ -14,6 +15,16 @@ const productSchema = new mongoose.Schema(
 
     category: {
       type: String,
+      required: true,
+    },
+    region: {
+      type: String,
+      enum: ["Butembo", "China"],
+      required: true,
+    },
+    regionCode: {
+      type: String,
+      enum: ["Bbbb", "Cnnn"],
       required: true,
     },
     brand: {
@@ -52,10 +63,18 @@ const productSchema = new mongoose.Schema(
   }
 );
 
+productSchema.pre("validate", function (next) {
+  if (this.region && this.regionCode && !isValidRegionPair(this.region, this.regionCode)) {
+    return next(new Error(`regionCode "${this.regionCode}" does not match region "${this.region}"`));
+  }
+  next();
+});
+
 // Create index for better search performance
 productSchema.index({ name: "text", description: "text", brand: "text" });
 productSchema.index({ category: 1 });
 productSchema.index({ status: 1 });
+productSchema.index({ region: 1 });
 
 // Reuse if it already exists (prevents OverwriteModelError)
 const Product =
