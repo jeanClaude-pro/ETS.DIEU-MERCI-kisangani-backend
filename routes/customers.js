@@ -2,15 +2,33 @@ const express = require("express");
 const router = express.Router();
 const Customer = require("../models/Customer");
 const Sale = require("../models/Sale"); // Make sure to import Sale model
+const { ensureWalkInCustomer } = require("../utils/walkInCustomer");
+
+// GET /api/customers/walkin - Get the permanent system Walk-in Customer
+// (created lazily here as a fallback in case the startup bootstrap hasn't run)
+router.get("/walkin", async (req, res) => {
+  try {
+    const customer = await ensureWalkInCustomer();
+    res.json(customer);
+  } catch (error) {
+    console.error("Error fetching walk-in customer:", error);
+    res.status(500).json({ error: "Failed to fetch walk-in customer" });
+  }
+});
 
 // GET /api/customers - Get all customers with optional filtering
+// Excludes the system Walk-in Customer by default since it isn't a real
+// customer to manage; pass includeWalkIn=true to include it.
 router.get("/", async (req, res) => {
   try {
-    const { page = 1, limit = 50, search } = req.query;
-    
+    const { page = 1, limit = 50, search, includeWalkIn } = req.query;
+
     // Build filter object
     const filter = {};
-    
+    if (includeWalkIn !== "true") {
+      filter.isWalkIn = { $ne: true };
+    }
+
     if (search) {
       filter.$or = [
         { name: { $regex: search, $options: "i" } },
@@ -182,8 +200,8 @@ router.put("/:id", async (req, res) => {
 router.get("/stats/top", async (req, res) => {
   try {
     const { limit = 10 } = req.query;
-    
-    const topCustomers = await Customer.find()
+
+    const topCustomers = await Customer.find({ isWalkIn: { $ne: true } })
       .sort({ totalSpent: -1 })
       .limit(parseInt(limit));
     

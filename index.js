@@ -54,6 +54,8 @@ mongoose
   .then(async () => {
     console.log("✅ Connected to MongoDB Atlas");
     await backfillProductRegions();
+    const { ensureWalkInCustomer } = require("./utils/walkInCustomer");
+    await ensureWalkInCustomer();
     app.listen(PORT, () => {
       console.log(`🚀 Server running on port ${PORT}`);
     });

@@ -59,6 +59,12 @@ const saleSchema = new mongoose.Schema({
       type: String,
       trim: true,
       default: ""
+    },
+    // Denormalized so consumers (receipts, reports, analytics) can tell this
+    // was the system Walk-in Customer without joining to the Customer collection.
+    isWalkIn: {
+      type: Boolean,
+      default: false
     }
   },
   customerId: {

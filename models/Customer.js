@@ -30,6 +30,12 @@ const customerSchema = new mongoose.Schema({
   },
   lastPurchaseDate: {
     type: Date
+  },
+  // Marks the single permanent system record used for sales with no
+  // registered customer attached. See server/utils/walkInCustomer.js.
+  isWalkIn: {
+    type: Boolean,
+    default: false
   }
 }, {
   timestamps: true

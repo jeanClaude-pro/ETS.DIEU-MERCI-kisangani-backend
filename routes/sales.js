@@ -6,6 +6,24 @@ const Sale = require("../models/Sale");
 const Customer = require("../models/Customer");
 const Product = require("../models/Product");
 const authMiddleware = require("../middleware/auth");
+const { WALKIN_CUSTOMER_NAME, WALKIN_CUSTOMER_PHONE } = require("../utils/walkInCustomer");
+
+// A sale with no registered customer selected always falls back to the
+// permanent Walk-in Customer — the cashier is never forced to pick one.
+function resolveSaleCustomer(customer) {
+  const safeCustomer = customer || {};
+  const hasRegisteredCustomer = Boolean(safeCustomer.phone || safeCustomer.name);
+  const finalCustomer = hasRegisteredCustomer
+    ? safeCustomer
+    : { name: WALKIN_CUSTOMER_NAME, phone: WALKIN_CUSTOMER_PHONE, email: "" };
+
+  return {
+    name: finalCustomer.name || "",
+    phone: finalCustomer.phone || "",
+    email: finalCustomer.email || "",
+    isWalkIn: finalCustomer.phone === WALKIN_CUSTOMER_PHONE,
+  };
+}
 
 // normalize to the Sale model enum
 function normalizePaymentMethod(pm) {
@@ -41,6 +59,7 @@ async function updateCustomerData(customerData, saleTotal) {
         totalSpent: parseFloat(saleTotal),
         firstPurchaseDate: now,
         lastPurchaseDate: now,
+        isWalkIn: phone === WALKIN_CUSTOMER_PHONE,
       });
     }
     await customer.save();
@@ -514,8 +533,9 @@ router.post("/", authMiddleware, async (req, res) => {
     }
 
     // 🔹 HANDLE REGULAR SALE (existing logic)
-    // Customer info is optional — a sale can be made without client details
-    const safeCustomer = customer || {};
+    // Customer info is optional — a sale with no registered customer falls
+    // back to the permanent Walk-in Customer (see resolveSaleCustomer above).
+    const safeCustomer = resolveSaleCustomer(customer);
     if (!items || !Array.isArray(items) || items.length === 0) {
       return res
         .status(400)
@@ -583,11 +603,7 @@ router.post("/", authMiddleware, async (req, res) => {
     const saleData = {
       saleId,
       saleNumber,
-      customer: {
-        name: safeCustomer.name || "",
-        phone: safeCustomer.phone || "",
-        email: safeCustomer.email || "",
-      },
+      customer: safeCustomer,
       customerId: customerId,
       items: enrichedItems,
       subtotal,
@@ -1008,11 +1024,18 @@ router.put("/:id", authMiddleware, async (req, res) => {
       }
     }
 
+    // Resolve the (possibly new) customer the same way sale creation does —
+    // falls back to the permanent Walk-in Customer when none is selected.
+    const safeCustomer = resolveSaleCustomer(customer);
+    const newCustomerId = safeCustomer.phone
+      ? await updateCustomerData(safeCustomer, total)
+      : null;
+
     // Track what changed
-    if (JSON.stringify(originalSale.customer) !== JSON.stringify(customer)) {
-      changes.set('customer', { from: originalSale.customer, to: customer });
+    if (JSON.stringify(originalSale.customer) !== JSON.stringify(safeCustomer)) {
+      changes.set('customer', { from: originalSale.customer, to: safeCustomer });
     }
-    
+
     if (originalSale.total !== total) {
       changes.set('total', { from: originalSale.total, to: total });
     }
@@ -1030,7 +1053,8 @@ router.put("/:id", authMiddleware, async (req, res) => {
     const updatedSale = await Sale.findByIdAndUpdate(
       id,
       {
-        customer,
+        customer: safeCustomer,
+        customerId: newCustomerId,
         items: enrichedItems,
         subtotal,
         total,
@@ -1053,9 +1077,18 @@ router.put("/:id", authMiddleware, async (req, res) => {
       { new: true, runValidators: true }
     );
 
-    // FIX: Use recalculateCustomerStats instead of updateCustomerData
-    if (changes.has('customer') || changes.has('total')) {
+    // FIX: Use recalculateCustomerStats instead of updateCustomerData.
+    // Recalculate both the old and new customer when the sale moved between
+    // customers (e.g. Walk-in -> registered customer or vice versa), and the
+    // current customer when only the total changed.
+    const oldCustomerId = originalSale.customerId ? originalSale.customerId.toString() : null;
+    const newCustomerIdStr = newCustomerId ? newCustomerId.toString() : null;
+
+    if (oldCustomerId && oldCustomerId !== newCustomerIdStr) {
       await recalculateCustomerStats(originalSale.customerId);
+    }
+    if (newCustomerId && (changes.has('customer') || changes.has('total'))) {
+      await recalculateCustomerStats(newCustomerId);
     }
 
     res.json(updatedSale);
