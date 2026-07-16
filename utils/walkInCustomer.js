@@ -25,8 +25,30 @@ async function ensureWalkInCustomer() {
   return customer;
 }
 
+function resolveSaleCustomer(customer) {
+  const supplied = customer || {};
+  const isWalkIn = supplied.isWalkIn === true ||
+    !String(supplied.phone || "").trim() ||
+    supplied.phone === WALKIN_CUSTOMER_PHONE;
+  if (isWalkIn) {
+    return {
+      name: String(supplied.name || "").trim() || WALKIN_CUSTOMER_NAME,
+      phone: WALKIN_CUSTOMER_PHONE,
+      email: "",
+      isWalkIn: true,
+    };
+  }
+  return {
+    name: String(supplied.name || "").trim(),
+    phone: String(supplied.phone || "").trim(),
+    email: String(supplied.email || "").trim(),
+    isWalkIn: false,
+  };
+}
+
 module.exports = {
   WALKIN_CUSTOMER_NAME,
   WALKIN_CUSTOMER_PHONE,
   ensureWalkInCustomer,
+  resolveSaleCustomer,
 };

@@ -6,25 +6,12 @@ const Sale = require("../models/Sale");
 const Customer = require("../models/Customer");
 const Product = require("../models/Product");
 const authMiddleware = require("../middleware/auth");
-const { WALKIN_CUSTOMER_NAME, WALKIN_CUSTOMER_PHONE } = require("../utils/walkInCustomer");
+const { WALKIN_CUSTOMER_NAME, WALKIN_CUSTOMER_PHONE, resolveSaleCustomer } = require("../utils/walkInCustomer");
+const { VALID_REGION_CODES } = require("../utils/regions");
+const { buildCanonicalSaleItem, calculateRegionTotal } = require("../utils/saleIntegrity");
 
 // A sale with no registered customer selected always falls back to the
 // permanent Walk-in Customer — the cashier is never forced to pick one.
-function resolveSaleCustomer(customer) {
-  const safeCustomer = customer || {};
-  const hasRegisteredCustomer = Boolean(safeCustomer.phone || safeCustomer.name);
-  const finalCustomer = hasRegisteredCustomer
-    ? safeCustomer
-    : { name: WALKIN_CUSTOMER_NAME, phone: WALKIN_CUSTOMER_PHONE, email: "" };
-
-  return {
-    name: finalCustomer.name || "",
-    phone: finalCustomer.phone || "",
-    email: finalCustomer.email || "",
-    isWalkIn: finalCustomer.phone === WALKIN_CUSTOMER_PHONE,
-  };
-}
-
 // normalize to the Sale model enum
 function normalizePaymentMethod(pm) {
   const v = String(pm || "cash").toLowerCase();
@@ -311,6 +298,9 @@ router.get("/", authMiddleware, async (req, res) => {
 
     // 5. Apply region filter if provided (matches any item in that region)
     if (region) {
+      if (!VALID_REGION_CODES.includes(region)) {
+        return res.status(400).json({ error: "Invalid region code" });
+      }
       filter["items.regionCode"] = region;
     }
 
@@ -333,7 +323,7 @@ router.get("/", authMiddleware, async (req, res) => {
         acc.totalExpenses += sale.total;
         acc.expenseCount += 1;
       } else {
-        acc.totalRevenue += sale.total;
+        acc.totalRevenue += region ? calculateRegionTotal(sale, region) : sale.total;
         acc.saleCount += 1;
       }
       return acc;
@@ -448,7 +438,7 @@ router.get("/stats/daily", authMiddleware, async (req, res) => {
     .lean();
 
     res.json({
-      date: targetDate.toISOString().split("T")[0],
+      date: dateStr,
       totalSales: dailySales[0]?.totalSales || 0,
       totalRevenue: dailySales[0]?.totalRevenue || 0,
       totalItems: dailySales[0]?.totalItems || 0,
@@ -545,7 +535,7 @@ router.post("/", authMiddleware, async (req, res) => {
     let subtotal = 0;
     const enrichedItems = [];
     for (const item of items) {
-      const { productId, quantity, price, name } = item || {};
+      const { productId, quantity, price } = item || {};
       if (!productId || !quantity || quantity <= 0 || !price || price < 0) {
         return res.status(400).json({
           error: "Each item requires productId, quantity>0, and price>=0",
@@ -572,18 +562,9 @@ router.post("/", authMiddleware, async (req, res) => {
         });
       }
 
-      const lineTotal = Number(price) * Number(quantity);
-      subtotal += lineTotal;
-
-      enrichedItems.push({
-        productId: new mongoose.Types.ObjectId(productId),
-        name: name || product.name,
-        quantity: Number(quantity),
-        price: Number(price),
-        total: lineTotal,
-        region: product.region,
-        regionCode: product.regionCode,
-      });
+      const canonicalItem = buildCanonicalSaleItem(product, { quantity, price });
+      subtotal += canonicalItem.total;
+      enrichedItems.push(canonicalItem);
     }
 
     const total = subtotal;
@@ -595,7 +576,7 @@ router.post("/", authMiddleware, async (req, res) => {
     const saleNumber = `SN-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
 
     // Only link to a customer record when phone is provided
-    const customerId = safeCustomer.phone
+    const customerId = !safeCustomer.isWalkIn && safeCustomer.phone
       ? await updateCustomerData(safeCustomer, total)
       : null;
 
@@ -934,7 +915,7 @@ router.put("/:id", authMiddleware, async (req, res) => {
     const enrichedItems = [];
     
     for (const item of items) {
-      const { productId, quantity, price, name } = item || {};
+      const { productId, quantity, price } = item || {};
       if (!productId || !quantity || quantity <= 0 || !price || price < 0) {
         return res.status(400).json({
           error: "Each item requires productId, quantity>0, and price>=0",
@@ -946,18 +927,9 @@ router.put("/:id", authMiddleware, async (req, res) => {
         return res.status(400).json({ error: `Product not found: ${productId}` });
       }
 
-      const lineTotal = Number(price) * Number(quantity);
-      subtotal += lineTotal;
-
-      enrichedItems.push({
-        productId: new mongoose.Types.ObjectId(productId),
-        name: name || product.name,
-        quantity: Number(quantity),
-        price: Number(price),
-        total: lineTotal,
-        region: product.region,
-        regionCode: product.regionCode,
-      });
+      const canonicalItem = buildCanonicalSaleItem(product, { quantity, price });
+      subtotal += canonicalItem.total;
+      enrichedItems.push(canonicalItem);
     }
 
     const total = subtotal;
@@ -1027,7 +999,7 @@ router.put("/:id", authMiddleware, async (req, res) => {
     // Resolve the (possibly new) customer the same way sale creation does —
     // falls back to the permanent Walk-in Customer when none is selected.
     const safeCustomer = resolveSaleCustomer(customer);
-    const newCustomerId = safeCustomer.phone
+    const newCustomerId = !safeCustomer.isWalkIn && safeCustomer.phone
       ? await updateCustomerData(safeCustomer, total)
       : null;
 

@@ -7,6 +7,13 @@ const productSchema = new mongoose.Schema(
       type: String,
       required: true,
       trim: true,
+      immutable: true,
+    },
+    originalName: {
+      type: String,
+      required: true,
+      trim: true,
+      immutable: true,
     },
     description: {
       type: String,
@@ -64,6 +71,7 @@ const productSchema = new mongoose.Schema(
 );
 
 productSchema.pre("validate", function (next) {
+  if (this.isNew && !this.originalName) this.originalName = this.name;
   if (this.region && this.regionCode && !isValidRegionPair(this.region, this.regionCode)) {
     return next(new Error(`regionCode "${this.regionCode}" does not match region "${this.region}"`));
   }

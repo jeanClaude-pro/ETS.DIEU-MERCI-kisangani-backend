@@ -48,12 +48,64 @@ async function backfillProductRegions() {
   }
 }
 
+async function repairSaleItemSnapshots() {
+  const Product = require("./models/Product");
+  const Sale = require("./models/Sale");
+  const { canonicalProductName, calculateLineTotal } = require("./utils/saleIntegrity");
+
+  await Product.updateMany(
+    { $or: [{ originalName: { $exists: false } }, { originalName: "" }] },
+    [{ $set: { originalName: "$name" } }]
+  );
+  const products = await Product.find({}).select("name originalName region regionCode").lean();
+  const productsById = new Map(products.map((product) => [String(product._id), product]));
+  const sales = await Sale.find({
+    type: { $in: ["sale", "reservation"] },
+    "items.0": { $exists: true },
+  });
+  let repaired = 0;
+  for (const sale of sales) {
+    let changed = false;
+    for (const item of sale.items) {
+      if (!item.productId) continue;
+      const product = productsById.get(String(item.productId));
+      if (!product?.region || !product?.regionCode) continue;
+      const name = canonicalProductName(product);
+      const total = calculateLineTotal(item);
+      if (item.name !== name || item.region !== product.region ||
+          item.regionCode !== product.regionCode || item.total !== total) {
+        item.name = name;
+        item.region = product.region;
+        item.regionCode = product.regionCode;
+        item.total = total;
+        changed = true;
+      }
+    }
+    const total = sale.items.reduce((sum, item) => sum + calculateLineTotal(item), 0);
+    if (sale.subtotal !== total || sale.total !== total) {
+      sale.subtotal = total;
+      sale.total = total;
+      changed = true;
+    }
+    if (changed) {
+      // Direct repair avoids blocking startup on unrelated incomplete legacy rows.
+      await Sale.updateOne(
+        { _id: sale._id },
+        { $set: { items: sale.items, subtotal: sale.subtotal, total: sale.total } }
+      );
+      repaired += 1;
+    }
+  }
+  if (repaired) console.log(`Repaired canonical names, regions, and totals for ${repaired} sale(s)`);
+}
+
 // ====== DB + Server Startup ======
 mongoose
   .connect(MONGO_URI)
   .then(async () => {
     console.log("✅ Connected to MongoDB Atlas");
     await backfillProductRegions();
+    await repairSaleItemSnapshots();
     const { ensureWalkInCustomer } = require("./utils/walkInCustomer");
     await ensureWalkInCustomer();
     app.listen(PORT, () => {

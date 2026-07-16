@@ -1,4 +1,6 @@
 const mongoose = require("mongoose");
+const { isValidRegionPair } = require("../utils/regions");
+const { calculateLineTotal } = require("../utils/saleIntegrity");
 
 const saleItemSchema = new mongoose.Schema({
   productId: {
@@ -222,15 +224,25 @@ saleSchema.index({ status: 1 });
 
 // Pre-save middleware to calculate item totals (only for sales with items)
 saleSchema.pre("save", function(next) {
-  // Only calculate totals if this is a sale with items
-  if (this.type === "sale" && this.items && this.items.length > 0) {
+  // Sales and reservations use the same authoritative line arithmetic.
+  if (["sale", "reservation"].includes(this.type) && this.items && this.items.length > 0) {
     this.items.forEach(item => {
-      if (item.price && item.quantity) {
-        item.total = item.price * item.quantity;
-      }
+      item.total = calculateLineTotal(item);
     });
+    this.subtotal = this.items.reduce((sum, item) => sum + item.total, 0);
+    this.total = this.subtotal;
   }
   
+  next();
+});
+
+saleSchema.pre("validate", function(next) {
+  const invalidItem = (this.items || []).find((item) =>
+    !item.region || !item.regionCode || !isValidRegionPair(item.region, item.regionCode)
+  );
+  if (["sale", "reservation"].includes(this.type) && invalidItem) {
+    return next(new Error("Every sale item must have a matching region and region code"));
+  }
   next();
 });
 

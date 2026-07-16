@@ -91,6 +91,7 @@ router.post("/", authMiddleware, isAdmin, async (req, res) => {
 
     const product = new Product({
       name,
+      originalName: name,
       description: description || "",
       category,
       brand: brand || "",
@@ -134,6 +135,14 @@ router.put("/:id", authMiddleware, isAdmin, async (req, res) => {
       regionCode,
     } = req.body;
 
+    const existingProduct = await Product.findById(req.params.id).lean();
+    if (!existingProduct) {
+      return res.status(404).json({ error: "Product not found" });
+    }
+    if (name !== undefined && name.trim() !== (existingProduct.originalName || existingProduct.name)) {
+      return res.status(400).json({ error: "Product names are permanent and cannot be changed or translated" });
+    }
+
     if ((region !== undefined || regionCode !== undefined) &&
         !isValidRegionPair(region, regionCode)) {
       return res.status(400).json({
@@ -144,7 +153,6 @@ router.put("/:id", authMiddleware, isAdmin, async (req, res) => {
     // Build update object with only provided fields
     const updateData = {};
 
-    if (name !== undefined) updateData.name = name;
     if (description !== undefined) updateData.description = description;
     if (category !== undefined) updateData.category = category;
     if (brand !== undefined) updateData.brand = brand;
