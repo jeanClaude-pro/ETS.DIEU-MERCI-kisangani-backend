@@ -70,28 +70,18 @@ async function repairSaleItemSnapshots() {
       if (!item.productId) continue;
       const product = productsById.get(String(item.productId));
       if (!product?.region || !product?.regionCode) continue;
-      const name = canonicalProductName(product);
       const total = calculateLineTotal(item);
-      if (item.name !== name || item.region !== product.region ||
-          item.regionCode !== product.regionCode || item.total !== total) {
-        item.name = name;
-        item.region = product.region;
-        item.regionCode = product.regionCode;
-        item.total = total;
-        changed = true;
-      }
-    }
-    const total = sale.items.reduce((sum, item) => sum + calculateLineTotal(item), 0);
-    if (sale.subtotal !== total || sale.total !== total) {
-      sale.subtotal = total;
-      sale.total = total;
-      changed = true;
+      if (!item.name) { item.name = canonicalProductName(product); changed = true; }
+      if (!item.region) { item.region = product.region; changed = true; }
+      if (!item.regionCode) { item.regionCode = product.regionCode; changed = true; }
+      if (!Number.isFinite(item.total)) { item.total = total; changed = true; }
+      if (!Number.isFinite(item.subtotal)) { item.subtotal = total; changed = true; }
     }
     if (changed) {
       // Direct repair avoids blocking startup on unrelated incomplete legacy rows.
       await Sale.updateOne(
         { _id: sale._id },
-        { $set: { items: sale.items, subtotal: sale.subtotal, total: sale.total } }
+        { $set: { items: sale.items } }
       );
       repaired += 1;
     }

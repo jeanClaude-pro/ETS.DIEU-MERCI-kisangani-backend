@@ -27,6 +27,15 @@ const saleItemSchema = new mongoose.Schema({
     required: false, // Made optional for expenses
     min: 0
   },
+  subtotal: { type: Number, required: false, min: 0 },
+  unitCost: { type: Number, required: false, min: 0 },
+  cost: { type: Number, required: false, min: 0 },
+  profit: { type: Number, required: false },
+  discount: { type: Number, required: false, min: 0, default: 0 },
+  tax: { type: Number, required: false, min: 0, default: 0 },
+  transportCost: { type: Number, required: false, min: 0, default: 0 },
+  otherCharges: { type: Number, required: false, min: 0, default: 0 },
+  netTotal: { type: Number, required: false, min: 0 },
   region: {
     type: String,
     enum: ["Butembo", "China"],
@@ -80,6 +89,12 @@ const saleSchema = new mongoose.Schema({
     required: false, // Made optional for expenses
     min: 0
   },
+  discount: { type: Number, min: 0, default: 0 },
+  tax: { type: Number, min: 0, default: 0 },
+  transportCost: { type: Number, min: 0, default: 0 },
+  otherCharges: { type: Number, min: 0, default: 0 },
+  cost: { type: Number, min: 0, default: 0 },
+  profit: { type: Number, default: 0 },
   total: {
     type: Number,
     required: true,
@@ -229,8 +244,11 @@ saleSchema.pre("save", function(next) {
     this.items.forEach(item => {
       item.total = calculateLineTotal(item);
     });
-    this.subtotal = this.items.reduce((sum, item) => sum + item.total, 0);
-    this.total = this.subtotal;
+    this.subtotal = Math.round(this.items.reduce((sum, item) => sum + item.total, 0) * 100) / 100;
+    this.cost = Math.round(this.items.reduce((sum, item) => sum + Number(item.cost || 0), 0) * 100) / 100;
+    this.total = Math.round((this.subtotal - Number(this.discount || 0) + Number(this.tax || 0) +
+      Number(this.transportCost || 0) + Number(this.otherCharges || 0)) * 100) / 100;
+    this.profit = Math.round((this.total - this.cost) * 100) / 100;
   }
   
   next();

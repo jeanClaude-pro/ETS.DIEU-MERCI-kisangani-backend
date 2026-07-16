@@ -8,7 +8,15 @@ const Product = require("../models/Product");
 const authMiddleware = require("../middleware/auth");
 const { WALKIN_CUSTOMER_NAME, WALKIN_CUSTOMER_PHONE, resolveSaleCustomer } = require("../utils/walkInCustomer");
 const { VALID_REGION_CODES } = require("../utils/regions");
-const { buildCanonicalSaleItem, calculateRegionTotal } = require("../utils/saleIntegrity");
+const { buildCanonicalSaleItem, buildEditedSaleItem, calculateRegionTotal, calculateSaleFinancials, allocateSaleFinancialsToItems } = require("../utils/saleIntegrity");
+const { aggregateItemQuantities, calculateStockDeltas } = require("../utils/saleMutations");
+
+class MutationError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
 
 // A sale with no registered customer selected always falls back to the
 // permanent Walk-in Customer — the cashier is never forced to pick one.
@@ -25,51 +33,57 @@ function normalizePaymentMethod(pm) {
   return "other";
 }
 
-// Helper function to update customer data (FIXED)
-async function updateCustomerData(customerData, saleTotal) {
-  const { name, phone, email } = customerData;
-  const now = new Date();
-  try {
-    let customer = await Customer.findOne({ phone });
-    if (customer) {
-      customer.totalPurchases += 1;
-      customer.totalSpent += parseFloat(saleTotal);
-      customer.lastPurchaseDate = now;
-      if (name && customer.name !== name) customer.name = name;
-      if (email && customer.email !== email) customer.email = email;
-    } else {
-      customer = new Customer({
-        name,
-        phone,
-        email: email || "",
-        totalPurchases: 1,
-        totalSpent: parseFloat(saleTotal),
-        firstPurchaseDate: now,
-        lastPurchaseDate: now,
-        isWalkIn: phone === WALKIN_CUSTOMER_PHONE,
-      });
+async function resolveLegacyItemRegions(sales) {
+  const unresolvedIds = new Set();
+  for (const sale of sales) {
+    for (const item of sale.items || []) {
+      if (!item.regionCode && item.productId) unresolvedIds.add(String(item.productId));
     }
-    await customer.save();
-    
-    // RETURN THE CUSTOMER ID
-    return customer._id;
-  } catch (error) {
-    console.error("Error updating customer data:", error);
-    return null;
   }
+  const products = unresolvedIds.size
+    ? await Product.find({ _id: { $in: [...unresolvedIds] } }).select("region regionCode").lean()
+    : [];
+  const byId = new Map(products.map((product) => [String(product._id), product]));
+  return sales.map((sale) => ({
+    ...sale,
+    items: (sale.items || []).map((item) => {
+      if (item.regionCode) return { ...item, regionResolution: "snapshot" };
+      const product = item.productId ? byId.get(String(item.productId)) : null;
+      return product?.regionCode
+        ? { ...item, region: product.region, regionCode: product.regionCode, regionResolution: "product-fallback" }
+        : { ...item, regionResolution: "unresolved" };
+    }),
+  }));
+}
+
+// Ensure the registered customer exists. Aggregate statistics are always
+// recalculated from committed sales, never incremented speculatively.
+async function updateCustomerData(customerData, session = null) {
+  const { name, phone, email } = customerData;
+  const customer = await Customer.findOneAndUpdate(
+    { phone },
+    {
+      $set: { name, email: email || "" },
+      $setOnInsert: { isWalkIn: phone === WALKIN_CUSTOMER_PHONE },
+    },
+    { new: true, upsert: true, runValidators: true, session }
+  );
+  return customer._id;
 }
 
 // Helper function to recalculate customer statistics (FIXED)
-async function recalculateCustomerStats(customerId) {
+async function recalculateCustomerStats(customerId, session = null) {
   try {
     // FIX: Only include completed sales (exclude voided and corrected)
-    const sales = await Sale.find({ 
+    let salesQuery = Sale.find({
       customerId: customerId,
       status: { $in: ["completed", "pending", undefined, null] } // Only valid sales
     })
     .sort({ createdAt: 1 })
     .select('total status type createdAt') // Only select needed fields
     .lean();
+    if (session) salesQuery = salesQuery.session(session);
+    const sales = await salesQuery;
     
     // Additional safety filter
     const validSales = sales.filter(sale => 
@@ -82,7 +96,7 @@ async function recalculateCustomerStats(customerId) {
         totalSpent: 0,
         firstPurchaseDate: null,
         lastPurchaseDate: null,
-      });
+      }, { session });
       return;
     }
     
@@ -301,14 +315,17 @@ router.get("/", authMiddleware, async (req, res) => {
       if (!VALID_REGION_CODES.includes(region)) {
         return res.status(400).json({ error: "Invalid region code" });
       }
-      filter["items.regionCode"] = region;
     }
 
     // Execute query - get ALL records within timeframe (no skip/limit)
-    const sales = await Sale.find(filter)
+    const foundSales = await Sale.find(filter)
       .select('-__v') // Exclude version key
       .sort({ createdAt: -1 }) // Newest first as requested
       .lean();
+    const resolvedSales = await resolveLegacyItemRegions(foundSales);
+    const sales = region
+      ? resolvedSales.filter((sale) => sale.items.some((item) => item.regionCode === region))
+      : resolvedSales;
     
     // Get count for metadata
     const total = sales.length;
@@ -463,6 +480,10 @@ router.post("/", authMiddleware, async (req, res) => {
       reservationTime,
       notes,
       exchangeRateSnapshot,
+      discount,
+      tax,
+      transportCost,
+      otherCharges,
       // 🔹 NEW EXPENSE FIELDS
       reason,
       recipientName,
@@ -567,7 +588,9 @@ router.post("/", authMiddleware, async (req, res) => {
       enrichedItems.push(canonicalItem);
     }
 
-    const total = subtotal;
+    const financials = calculateSaleFinancials(subtotal, { discount, tax, transportCost, otherCharges });
+    const allocatedItems = allocateSaleFinancialsToItems(enrichedItems, financials);
+    const total = financials.total;
     const saleId = `SALE-${Date.now()}-${Math.random()
       .toString(36)
       .substr(2, 5)
@@ -575,20 +598,16 @@ router.post("/", authMiddleware, async (req, res) => {
 
     const saleNumber = `SN-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
 
-    // Only link to a customer record when phone is provided
-    const customerId = !safeCustomer.isWalkIn && safeCustomer.phone
-      ? await updateCustomerData(safeCustomer, total)
-      : null;
-
     // UPDATED: Include type and reservation fields WITH CORRECT STATUS
     const saleData = {
       saleId,
       saleNumber,
       customer: safeCustomer,
-      customerId: customerId,
-      items: enrichedItems,
-      subtotal,
-      total,
+      customerId: null,
+      items: allocatedItems,
+      ...financials,
+      cost: allocatedItems.reduce((sum, item) => sum + item.cost, 0),
+      profit: total - allocatedItems.reduce((sum, item) => sum + item.cost, 0),
       paymentMethod: normalizedPM,
       status: type === "reservation" ? "pending" : "completed", // ✅ FIXED: Reservations as pending (money received)
       salesPerson: salesPerson || "Admin",
@@ -607,25 +626,32 @@ router.post("/", authMiddleware, async (req, res) => {
       })
     };
 
-    for (const it of enrichedItems) {
-      const updated = await Product.findOneAndUpdate(
-        { _id: it.productId, stock: { $gte: it.quantity } },
-        { $inc: { stock: -it.quantity } },
-        { new: true }
-      );
-      if (!updated) {
-        return res.status(409).json({
-          error: "Stock changed for an item. Please refresh and try again.",
-        });
-      }
+    const session = await mongoose.startSession();
+    let savedSale;
+    try {
+      await session.withTransaction(async () => {
+        if (!safeCustomer.isWalkIn && safeCustomer.phone) {
+          saleData.customerId = await updateCustomerData(safeCustomer, session);
+        }
+        for (const [productId, quantity] of aggregateItemQuantities(enrichedItems)) {
+          const updated = await Product.findOneAndUpdate(
+            { _id: productId, stock: { $gte: quantity } },
+            { $inc: { stock: -quantity } },
+            { new: true, session }
+          );
+          if (!updated) throw new MutationError(409, "Stock changed for an item. Please refresh and try again.");
+        }
+        [savedSale] = await Sale.create([saleData], { session });
+        if (saleData.customerId) await recalculateCustomerStats(saleData.customerId, session);
+      });
+    } finally {
+      await session.endSession();
     }
-
-    const sale = new Sale(saleData);
-    const savedSale = await sale.save();
 
     return res.status(201).json(savedSale);
   } catch (error) {
     console.error("Error creating sale/expense:", error);
+    if (error instanceof MutationError) return res.status(error.status).json({ error: error.message });
     if (error.name === "ValidationError") {
       const errors = Object.values(error.errors).map((e) => e.message);
       return res.status(400).json({ error: errors.join(", ") });
@@ -715,13 +741,19 @@ router.get("/reservations/all", authMiddleware, async (req, res) => {
     }
 
     if (region) {
-      filter["items.regionCode"] = region;
+      if (!VALID_REGION_CODES.includes(region)) {
+        return res.status(400).json({ error: "Invalid region code" });
+      }
     }
 
-    const reservations = await Sale.find(filter)
+    const foundReservations = await Sale.find(filter)
       .select('-__v') // Exclude version key
       .sort({ createdAt: -1 })
       .lean();
+    const resolvedReservations = await resolveLegacyItemRegions(foundReservations);
+    const reservations = region
+      ? resolvedReservations.filter((sale) => sale.items.some((item) => item.regionCode === region))
+      : resolvedReservations;
 
     const total = reservations.length;
     const pendingCount = reservations.filter(r => r.status === "pending").length;
@@ -810,7 +842,11 @@ router.put("/:id", authMiddleware, async (req, res) => {
       // Expense fields
       recipientName,
       recipientPhone,
-      amount
+      amount,
+      discount,
+      tax,
+      transportCost,
+      otherCharges,
     } = req.body;
 
     // Find the original sale
@@ -909,6 +945,10 @@ router.put("/:id", authMiddleware, async (req, res) => {
     // 🔹 HANDLE REGULAR SALE EDITING
     // Track changes for audit
     const changes = new Map();
+    const originalItems = originalSale.items || [];
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: "Sale must contain at least one item" });
+    }
 
     // Validate and process items
     let subtotal = 0;
@@ -922,86 +962,29 @@ router.put("/:id", authMiddleware, async (req, res) => {
         });
       }
 
+      const oldItem = originalItems.find((candidate) =>
+        candidate.productId && String(candidate.productId) === String(productId)
+      );
       const product = await Product.findById(productId).lean();
-      if (!product) {
+      if (!product && !oldItem) {
         return res.status(400).json({ error: `Product not found: ${productId}` });
       }
-
-      const canonicalItem = buildCanonicalSaleItem(product, { quantity, price });
+      const canonicalItem = buildEditedSaleItem(product, oldItem, { productId, quantity, price });
       subtotal += canonicalItem.total;
       enrichedItems.push(canonicalItem);
     }
 
-    const total = subtotal;
+    const financials = calculateSaleFinancials(subtotal, {
+      discount: discount ?? originalSale.discount,
+      tax: tax ?? originalSale.tax,
+      transportCost: transportCost ?? originalSale.transportCost,
+      otherCharges: otherCharges ?? originalSale.otherCharges,
+    });
+    const allocatedItems = allocateSaleFinancialsToItems(enrichedItems, financials);
+    const total = financials.total;
 
-    // Calculate stock adjustments
-    const stockAdjustments = [];
-    
-    for (const newItem of enrichedItems) {
-      const oldItem = originalSale.items.find(item => 
-        item.productId.toString() === newItem.productId.toString()
-      );
-
-      if (oldItem) {
-        // Item exists in both old and new - calculate quantity difference
-        const quantityDiff = newItem.quantity - oldItem.quantity;
-        if (quantityDiff !== 0) {
-          stockAdjustments.push({
-            productId: newItem.productId,
-            adjustment: -quantityDiff // Negative because we're reversing old sale and applying new
-          });
-        }
-      } else {
-        // New item added - need to reduce stock
-        stockAdjustments.push({
-          productId: newItem.productId,
-          adjustment: -newItem.quantity
-        });
-      }
-    }
-
-    // Handle removed items - return stock
-    for (const oldItem of originalSale.items) {
-      const itemStillExists = enrichedItems.find(item => 
-        item.productId.toString() === oldItem.productId.toString()
-      );
-      
-      if (!itemStillExists) {
-        stockAdjustments.push({
-          productId: oldItem.productId,
-          adjustment: oldItem.quantity // Positive because we're returning stock
-        });
-      }
-    }
-
-    // Apply stock adjustments
-    for (const adjustment of stockAdjustments) {
-      const updatedProduct = await Product.findByIdAndUpdate(
-        adjustment.productId,
-        { $inc: { stock: adjustment.adjustment } },
-        { new: true }
-      );
-      
-      if (!updatedProduct || updatedProduct.stock < 0) {
-        // Rollback previous adjustments if any fail
-        for (const rollbackAdj of stockAdjustments) {
-          await Product.findByIdAndUpdate(
-            rollbackAdj.productId,
-            { $inc: { stock: -rollbackAdj.adjustment } }
-          );
-        }
-        return res.status(400).json({ 
-          error: `Insufficient stock for product update` 
-        });
-      }
-    }
-
-    // Resolve the (possibly new) customer the same way sale creation does —
-    // falls back to the permanent Walk-in Customer when none is selected.
+    const stockDeltas = calculateStockDeltas(originalItems, enrichedItems);
     const safeCustomer = resolveSaleCustomer(customer);
-    const newCustomerId = !safeCustomer.isWalkIn && safeCustomer.phone
-      ? await updateCustomerData(safeCustomer, total)
-      : null;
 
     // Track what changed
     if (JSON.stringify(originalSale.customer) !== JSON.stringify(safeCustomer)) {
@@ -1011,61 +994,86 @@ router.put("/:id", authMiddleware, async (req, res) => {
     if (originalSale.total !== total) {
       changes.set('total', { from: originalSale.total, to: total });
     }
+    if (JSON.stringify(originalItems) !== JSON.stringify(allocatedItems)) {
+      changes.set('items', { from: originalItems, to: allocatedItems });
+    }
     
     if (originalSale.paymentMethod !== normalizedPM) {
       changes.set('paymentMethod', { from: originalSale.paymentMethod, to: normalizedPM });
     }
 
     // Track type changes
-    if (originalSale.type !== type) {
-      changes.set('type', { from: originalSale.type, to: type });
+    const effectiveType = type || originalSale.type;
+    if (originalSale.type !== effectiveType) {
+      changes.set('type', { from: originalSale.type, to: effectiveType });
     }
 
-    // Update the sale
-    const updatedSale = await Sale.findByIdAndUpdate(
-      id,
-      {
-        customer: safeCustomer,
-        customerId: newCustomerId,
-        items: enrichedItems,
-        subtotal,
-        total,
-        paymentMethod: normalizedPM,
-        type: type || originalSale.type,
-        reservationDate: reservationDate || originalSale.reservationDate,
-        reservationTime: reservationTime || originalSale.reservationTime,
-        notes: notes || originalSale.notes,
-        editedBy: req.user.userId,
-        editedAt: new Date(),
-        $push: {
-          editHistory: {
-            editedBy: req.user.userId,
-            editedAt: new Date(),
-            changes: Object.fromEntries(changes),
-            reason: reason || "Sale correction"
+    const session = await mongoose.startSession();
+    let updatedSale;
+    try {
+      await session.withTransaction(async () => {
+        for (const { productId, delta } of stockDeltas) {
+          const productFilter = delta < 0
+            ? { _id: productId, stock: { $gte: -delta } }
+            : { _id: productId };
+          const updatedProduct = await Product.findOneAndUpdate(
+            productFilter,
+            { $inc: { stock: delta } },
+            { new: true, session }
+          );
+          if (!updatedProduct && delta < 0) {
+            throw new MutationError(409, `Insufficient stock or deleted product: ${productId}`);
           }
         }
-      },
-      { new: true, runValidators: true }
-    );
 
-    // FIX: Use recalculateCustomerStats instead of updateCustomerData.
-    // Recalculate both the old and new customer when the sale moved between
-    // customers (e.g. Walk-in -> registered customer or vice versa), and the
-    // current customer when only the total changed.
-    const oldCustomerId = originalSale.customerId ? originalSale.customerId.toString() : null;
-    const newCustomerIdStr = newCustomerId ? newCustomerId.toString() : null;
+        const newCustomerId = !safeCustomer.isWalkIn && safeCustomer.phone
+          ? await updateCustomerData(safeCustomer, session)
+          : null;
+        updatedSale = await Sale.findOneAndUpdate(
+          { _id: id, updatedAt: originalSale.updatedAt },
+          {
+            customer: safeCustomer,
+            customerId: newCustomerId,
+            items: allocatedItems,
+            ...financials,
+            cost: allocatedItems.reduce((sum, item) => sum + item.cost, 0),
+            profit: total - allocatedItems.reduce((sum, item) => sum + item.cost, 0),
+            paymentMethod: normalizedPM,
+            type: effectiveType,
+            reservationDate: reservationDate || originalSale.reservationDate,
+            reservationTime: reservationTime || originalSale.reservationTime,
+            notes: notes || originalSale.notes,
+            editedBy: req.user.userId,
+            editedAt: new Date(),
+            $push: {
+              editHistory: {
+                editedBy: req.user.userId,
+                editedAt: new Date(),
+                changes: Object.fromEntries(changes),
+                reason: reason || "Sale correction"
+              }
+            }
+          },
+          { new: true, runValidators: true, session }
+        );
+        if (!updatedSale) throw new MutationError(409, "Sale changed while you were editing. Refresh and try again.");
 
-    if (oldCustomerId && oldCustomerId !== newCustomerIdStr) {
-      await recalculateCustomerStats(originalSale.customerId);
-    }
-    if (newCustomerId && (changes.has('customer') || changes.has('total'))) {
-      await recalculateCustomerStats(newCustomerId);
+        const customerIds = new Set([
+          originalSale.customerId ? String(originalSale.customerId) : null,
+          newCustomerId ? String(newCustomerId) : null,
+        ].filter(Boolean));
+        for (const customerId of customerIds) {
+          await recalculateCustomerStats(customerId, session);
+        }
+      });
+    } finally {
+      await session.endSession();
     }
 
     res.json(updatedSale);
   } catch (error) {
     console.error("Error editing sale:", error);
+    if (error instanceof MutationError) return res.status(error.status).json({ error: error.message });
     if (error.name === "CastError") {
       return res.status(400).json({ error: "Invalid sale ID" });
     }
@@ -1152,6 +1160,7 @@ router.patch("/:id/pending", authMiddleware, async (req, res) => {
 
 /** ---------- VOID/REFUND SALE ---------- **/
 router.patch("/:id/void", authMiddleware, async (req, res) => {
+  const session = await mongoose.startSession();
   try {
     if (req.user.role !== "admin") {
       return res.status(403).json({ error: "Only admins can void sales" });
@@ -1160,130 +1169,102 @@ router.patch("/:id/void", authMiddleware, async (req, res) => {
     const { id } = req.params;
     const { reason } = req.body;
 
-    const sale = await Sale.findById(id).lean();
-    if (!sale) {
-      return res.status(404).json({ error: "Sale not found" });
-    }
+    let voidedSale;
+    let stockWarnings = [];
+    await session.withTransaction(async () => {
+      stockWarnings = [];
+      const sale = await Sale.findById(id).session(session).lean();
+      if (!sale) throw new MutationError(404, "Sale not found");
+      if (sale.status === "voided") throw new MutationError(400, "Sale is already voided");
 
-    if (sale.status === "voided") {
-      return res.status(400).json({ error: "Sale is already voided" });
-    }
-
-    // Return stock to inventory (only for sales and reservations with items)
-    // ✅ FIXED: Check for reservation type as well
-    if ((sale.type === "sale" || sale.type === "reservation") && sale.items && sale.items.length > 0) {
-      for (const item of sale.items) {
-        await Product.findByIdAndUpdate(
-          item.productId,
-          { $inc: { stock: item.quantity } }
-        );
-      }
-    }
-
-    const voidedSale = await Sale.findByIdAndUpdate(
-      id,
-      {
-        status: "voided",
-        voidedBy: req.user.userId,
-        voidedAt: new Date(),
-        $push: {
-          editHistory: {
-            editedBy: req.user.userId,
-            editedAt: new Date(),
-            changes: { status: { from: sale.status, to: "voided" } },
-            reason: reason || "Sale voided"
-          }
+      if (["sale", "reservation"].includes(sale.type)) {
+        for (const [productId, quantity] of aggregateItemQuantities(sale.items)) {
+          const product = await Product.findByIdAndUpdate(
+            productId, { $inc: { stock: quantity } }, { new: true, session }
+          );
+          if (!product) stockWarnings.push(`Deleted product ${productId}: stock could not be restored`);
         }
-      },
-      { new: true }
-    );
+      }
+      voidedSale = await Sale.findByIdAndUpdate(
+        id,
+        {
+          status: "voided",
+          voidedBy: req.user.userId,
+          voidedAt: new Date(),
+          $push: {
+            editHistory: {
+              editedBy: req.user.userId,
+              editedAt: new Date(),
+              changes: { status: { from: sale.status, to: "voided" } },
+              reason: reason || "Sale voided"
+            }
+          }
+        },
+        { new: true, session }
+      );
+      if (sale.customerId && ["sale", "reservation"].includes(sale.type)) {
+        await recalculateCustomerStats(sale.customerId, session);
+      }
+    });
 
-    // FIX: Recalculate customer stats after voiding (only for sales and reservations)
-    if (sale.customerId && (sale.type === "sale" || sale.type === "reservation")) {
-      await recalculateCustomerStats(sale.customerId);
-    }
-
-    res.json(voidedSale);
+    res.json({
+      ...voidedSale.toObject(),
+      stockReturned: stockWarnings.length === 0,
+      stockWarnings,
+    });
   } catch (error) {
     console.error("Error voiding sale:", error);
+    if (error instanceof MutationError) return res.status(error.status).json({ error: error.message });
     res.status(500).json({ error: "Failed to void sale" });
+  } finally {
+    await session.endSession();
   }
 });
 
 /** ---------- DELETE SALE ---------- **/
 router.delete("/:id", authMiddleware, async (req, res) => {
+  const session = await mongoose.startSession();
   try {
-    const sale = await Sale.findById(req.params.id).lean();
-    
-    if (!sale) {
-      return res.status(404).json({ error: "Sale not found" });
+    if (req.user.role !== "admin") {
+      return res.status(403).json({ error: "Only admins can permanently delete sales" });
     }
+    let deletedSale;
+    let stockWarnings = [];
+    await session.withTransaction(async () => {
+      stockWarnings = [];
+      const sale = await Sale.findById(req.params.id).session(session).lean();
+      if (!sale) throw new MutationError(404, "Sale not found");
+      deletedSale = sale;
 
-    // 🔹 NEW: RESTRICTION - Only admin can delete reservations
-    if (sale.type === "reservation" && req.user.role !== "admin") {
-      return res.status(403).json({ 
-        error: "Only admin can delete reservations" 
-      });
-    }
-
-    const customerId = sale.customerId;
-    
-    // ✅ FIXED: RETURN STOCK TO INVENTORY WHEN DELETING RESERVATIONS OR SALES
-    // Only return stock if the sale wasn't already voided (to avoid double return)
-    if ((sale.type === "reservation" || sale.type === "sale") && 
-        sale.items && sale.items.length > 0 && 
-        sale.status !== "voided") {
-      
-      console.log(`🔄 Returning stock for deleted ${sale.type}:`, {
-        saleId: sale._id,
-        itemsCount: sale.items.length,
-        items: sale.items.map(item => ({
-          productId: item.productId,
-          name: item.name,
-          quantity: item.quantity
-        }))
-      });
-      
-      for (const item of sale.items) {
-        try {
-          const updatedProduct = await Product.findByIdAndUpdate(
-            item.productId,
-            { $inc: { stock: item.quantity } },
-            { new: true }
+      if (["sale", "reservation"].includes(sale.type) && sale.status !== "voided") {
+        for (const [productId, quantity] of aggregateItemQuantities(sale.items)) {
+          const product = await Product.findByIdAndUpdate(
+            productId, { $inc: { stock: quantity } }, { new: true, session }
           );
-          
-          if (updatedProduct) {
-            console.log(`✅ Returned ${item.quantity} units of "${item.name}", new stock: ${updatedProduct.stock}`);
-          } else {
-            console.warn(`❌ Product not found for ID: ${item.productId}`);
-          }
-        } catch (productError) {
-          console.error(`Error returning stock for product ${item.productId}:`, productError);
+          if (!product) stockWarnings.push(`Deleted product ${productId}: stock could not be restored`);
         }
       }
-    }
-
-    // Delete the sale record
-    await Sale.findByIdAndDelete(req.params.id);
-
-    // Update customer statistics (only for sales and reservations, not expenses)
-    if (customerId && (sale.type === "sale" || sale.type === "reservation")) {
-      await recalculateCustomerStats(customerId);
-    }
-
+      await Sale.deleteOne({ _id: sale._id }, { session });
+      if (sale.customerId && ["sale", "reservation"].includes(sale.type)) {
+        await recalculateCustomerStats(sale.customerId, session);
+      }
+    });
     res.json({ 
       success: true,
       message: "Sale deleted successfully",
-      stockReturned: (sale.type === "reservation" || sale.type === "sale") && sale.items && sale.items.length > 0
+      stockReturned: ["sale", "reservation"].includes(deletedSale.type) &&
+        deletedSale.status !== "voided" && stockWarnings.length === 0,
+      stockWarnings,
     });
   } catch (error) {
     console.error("Error deleting sale:", error);
-    
+    if (error instanceof MutationError) return res.status(error.status).json({ error: error.message });
     if (error.name === "CastError") {
       return res.status(400).json({ error: "Invalid sale ID" });
     }
-    
     res.status(500).json({ error: "Failed to delete sale" });
+  } finally {
+    await session.endSession();
   }
 });
 

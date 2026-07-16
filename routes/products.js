@@ -71,6 +71,7 @@ router.post("/", authMiddleware, isAdmin, async (req, res) => {
       minStock,
       unit,
       weight,
+      unitCost,
       status,
       region,
       regionCode,
@@ -99,6 +100,7 @@ router.post("/", authMiddleware, isAdmin, async (req, res) => {
       minStock: Number(minStock) || 0,
       unit: unit || "pcs",
       weight: Number(weight) || 0,
+      unitCost: Number(unitCost) || 0,
       status: status || "active",
       region,
       regionCode,
@@ -130,6 +132,7 @@ router.put("/:id", authMiddleware, isAdmin, async (req, res) => {
       minStock,
       unit,
       weight,
+      unitCost,
       status,
       region,
       regionCode,
@@ -160,6 +163,7 @@ router.put("/:id", authMiddleware, isAdmin, async (req, res) => {
     if (minStock !== undefined) updateData.minStock = Number(minStock);
     if (unit !== undefined) updateData.unit = unit;
     if (weight !== undefined) updateData.weight = Number(weight);
+    if (unitCost !== undefined) updateData.unitCost = Number(unitCost);
     if (status !== undefined) updateData.status = status;
     if (region !== undefined) updateData.region = region;
     if (regionCode !== undefined) updateData.regionCode = regionCode;
