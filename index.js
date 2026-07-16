@@ -99,20 +99,53 @@ async function repairSaleItemSnapshots() {
   if (repaired) console.log(`Repaired canonical names, regions, and totals for ${repaired} sale(s)`);
 }
 
+// ====== Maintenance tasks (run after listen, never block or crash startup) ======
+// Each task is isolated: a failure in one is logged but does not stop the
+// others or affect the already-open server port.
+async function runMaintenanceTasks() {
+  const tasks = [
+    { name: "backfillProductRegions", run: backfillProductRegions },
+    { name: "repairSaleItemSnapshots", run: repairSaleItemSnapshots },
+    {
+      name: "ensureWalkInCustomer",
+      run: () => require("./utils/walkInCustomer").ensureWalkInCustomer(),
+    },
+  ];
+  for (const task of tasks) {
+    try {
+      await task.run();
+    } catch (err) {
+      console.error(`⚠️ Maintenance task "${task.name}" failed:`, err.message);
+    }
+  }
+}
+
 // ====== DB + Server Startup ======
+// Render (and similar PaaS platforms) detect a live deployment by scanning
+// for an open port shortly after boot. app.listen() must therefore run as
+// soon as MongoDB is connected, binding to 0.0.0.0 so it's reachable from
+// outside the container. Maintenance/migration tasks run afterward in the
+// background so they can never delay or block port binding.
 mongoose
   .connect(MONGO_URI)
-  .then(async () => {
+  .then(() => {
     console.log("✅ Connected to MongoDB Atlas");
-    await backfillProductRegions();
-    await repairSaleItemSnapshots();
-    const { ensureWalkInCustomer } = require("./utils/walkInCustomer");
-    await ensureWalkInCustomer();
-    app.listen(PORT, () => {
+    app.listen(PORT, "0.0.0.0", () => {
       console.log(`🚀 Server running on port ${PORT}`);
+      runMaintenanceTasks();
     });
   })
   .catch((err) => {
     console.error("❌ MongoDB connection error:", err.message);
     process.exit(1);
   });
+
+// ====== Process-level safety nets ======
+// Log unexpected async failures instead of letting them crash the process
+// and take down an already-bound port.
+process.on("unhandledRejection", (reason) => {
+  console.error("⚠️ Unhandled promise rejection:", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("⚠️ Uncaught exception:", err);
+});
