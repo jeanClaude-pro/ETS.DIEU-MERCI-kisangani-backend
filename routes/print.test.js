@@ -4,17 +4,27 @@ const printRouter = require("./print");
 
 class FakePrinter {
   constructor() {
+    this.operations = [];
     this.textLines = [];
-    this.cutCount = 0;
+    this.cutCalls = [];
   }
 
-  font() { return this; }
-  align() { return this; }
-  style() { return this; }
-  size() { return this; }
-  feed() { return this; }
-  text(value) { this.textLines.push(String(value)); return this; }
-  cut() { this.cutCount += 1; return this; }
+  font(value) { this.operations.push(`font:${value}`); return this; }
+  align(value) { this.operations.push(`align:${value}`); return this; }
+  style(value) { this.operations.push(`style:${value}`); return this; }
+  size(width, height) { this.operations.push(`size:${width}x${height}`); return this; }
+  encode(value) { this.operations.push(`encode:${value}`); return this; }
+  setCharacterCodeTable(value) { this.operations.push(`table:${value}`); return this; }
+  text(value) {
+    this.textLines.push(String(value));
+    this.operations.push(`text:${value}`);
+    return this;
+  }
+  cut(part, feed) {
+    this.cutCalls.push({ part, feed });
+    this.operations.push(`cut:${feed}`);
+    return this;
+  }
 }
 
 const savedReceipt = {
@@ -24,7 +34,13 @@ const savedReceipt = {
   customerName: "Amina",
   customerPhone: "+243000000",
   items: [
-    { name: "Article A", quantity: 2, unitPrice: 10, lineTotal: 20, regionCode: "Bbbb" },
+    {
+      name: "Chemise très longue pour femme avec détails brodés élégants",
+      quantity: 2,
+      unitPrice: 10,
+      lineTotal: 20,
+      regionCode: "Bbbb",
+    },
     { name: "Article B", quantity: 1, unitPrice: 30, lineTotal: 30, regionCode: "Cnnn" },
   ],
   subtotal: 50,
@@ -38,25 +54,92 @@ const savedReceipt = {
   exchangeRate: 2800,
 };
 
-test("ESC/POS sale job formats the detailed receipt and compact stub", () => {
-  const { normalizeReceiptData, printMainReceipt, printStub, BUSINESS } = printRouter._testing;
+test("ESC/POS receipt is readable, wraps names, and uses minimal cut feed", () => {
+  const {
+    normalizeReceiptData,
+    printMainReceipt,
+    BUSINESS,
+    PAPER_COLUMNS,
+    MINIMUM_CUT_FEED,
+    PRINTER_ENCODING,
+  } = printRouter._testing;
   const receipt = normalizeReceiptData(savedReceipt, "sale");
   const printer = new FakePrinter();
 
   printMainReceipt(printer, receipt);
-  printStub(printer, receipt);
 
-  assert.equal(printer.cutCount, 2);
-  assert.equal(printer.textLines.filter((value) => value === BUSINESS.name).length, 2);
-  assert.ok(printer.textLines.includes("RECU DE VENTE"));
-  assert.ok(printer.textLines.includes("SOUCHE VENTE"));
+  assert.equal(printer.cutCalls.length, 1);
+  assert.deepEqual(printer.cutCalls[0], { part: false, feed: MINIMUM_CUT_FEED });
+  assert.equal(MINIMUM_CUT_FEED, 1);
+  assert.ok(printer.operations.includes(`encode:${PRINTER_ENCODING}`));
+  assert.ok(printer.textLines.includes(BUSINESS.name));
+  assert.ok(printer.textLines.includes("REÇU DE VENTE"));
+  assert.ok(printer.textLines.some((value) => value.includes("Référence")));
   assert.ok(printer.textLines.some((value) => value.includes("Remise")));
   assert.ok(printer.textLines.some((value) => value.includes("TOTAL FC")));
   assert.ok(printer.textLines.some((value) => value.includes("Bbbb")));
-  assert.ok(printer.textLines.some((value) => value.includes("Cnnn")));
+  assert.ok(printer.textLines.every((value) => value.length <= PAPER_COLUMNS));
+  assert.equal(printer.operations.some((value) => value.startsWith("feed:")), false);
 });
 
-test("ESC/POS reservation job remains explicitly identified", () => {
+test("ESC/POS sends and flushes the full receipt before building the stub", async () => {
+  const { normalizeReceiptData, sendReceiptThenStub } = printRouter._testing;
+  const receipt = normalizeReceiptData(savedReceipt, "sale");
+  const printer = new FakePrinter();
+  const flushCuts = [];
+
+  const printed = await sendReceiptThenStub(printer, receipt, async (activePrinter) => {
+    flushCuts.push(activePrinter.cutCalls.length);
+    activePrinter.operations.push(`flush:${activePrinter.cutCalls.length}`);
+  });
+
+  assert.deepEqual(printed, ["receipt", "stub"]);
+  assert.deepEqual(flushCuts, [1, 2]);
+  const receiptTitle = printer.operations.indexOf("text:REÇU DE VENTE");
+  const firstCut = printer.operations.indexOf("cut:1");
+  const firstFlush = printer.operations.indexOf("flush:1");
+  const stubTitle = printer.operations.indexOf("text:SOUCHE DE VENTE");
+  const secondFlush = printer.operations.indexOf("flush:2");
+  assert.ok(receiptTitle < firstCut);
+  assert.ok(firstCut < firstFlush);
+  assert.ok(firstFlush < stubTitle);
+  assert.ok(stubTitle < secondFlush);
+  assert.ok(printer.textLines.includes("Statut : COMPLETED"));
+  assert.ok(printer.textLines.includes("ARTICLES / QUANTITÉS"));
+  assert.ok(printer.textLines.some((value) => value.startsWith("Quantité") && value.endsWith("2")));
+});
+
+test("empty and malformed payloads are rejected before a printer job", () => {
+  const { normalizeReceiptData, isValidReceiptData } = printRouter._testing;
+  assert.equal(isValidReceiptData(normalizeReceiptData({})), false);
+  assert.equal(isValidReceiptData(normalizeReceiptData({ ...savedReceipt, reference: "" })), false);
+  assert.equal(isValidReceiptData(normalizeReceiptData({
+    ...savedReceipt,
+    items: [{ name: "Article", quantity: 0, unitPrice: 10, lineTotal: 0 }],
+  })), false);
+  assert.equal(isValidReceiptData(normalizeReceiptData(savedReceipt)), true);
+});
+
+test("a stub transfer failure reports that only the receipt was printed", async () => {
+  const { normalizeReceiptData, sendReceiptThenStub } = printRouter._testing;
+  const receipt = normalizeReceiptData(savedReceipt, "sale");
+  const printer = new FakePrinter();
+  let flushCount = 0;
+
+  await assert.rejects(async () => {
+    try {
+      await sendReceiptThenStub(printer, receipt, async () => {
+        flushCount += 1;
+        if (flushCount === 2) throw new Error("USB transfer failed");
+      });
+    } catch (error) {
+      assert.deepEqual(error.printedDocuments, ["receipt"]);
+      throw error;
+    }
+  }, /USB transfer failed/);
+});
+
+test("ESC/POS reservation receipt and stub retain French labels and reset state", () => {
   const { normalizeReceiptData, printMainReceipt, printStub } = printRouter._testing;
   const receipt = normalizeReceiptData({
     ...savedReceipt,
@@ -70,8 +153,9 @@ test("ESC/POS reservation job remains explicitly identified", () => {
   printMainReceipt(printer, receipt);
   printStub(printer, receipt);
 
-  assert.ok(printer.textLines.includes("RECU DE RESERVATION"));
-  assert.ok(printer.textLines.includes("SOUCHE RESERVATION"));
-  assert.ok(printer.textLines.some((value) => value === "Statut: PENDING"));
-  assert.equal(printer.cutCount, 2);
+  assert.ok(printer.textLines.includes("REÇU DE RÉSERVATION"));
+  assert.ok(printer.textLines.includes("SOUCHE DE RÉSERVATION"));
+  assert.ok(printer.textLines.some((value) => value === "Statut : PENDING"));
+  assert.equal(printer.cutCalls.length, 2);
+  assert.equal(printer.operations.filter((value) => value === "style:normal").length >= 2, true);
 });

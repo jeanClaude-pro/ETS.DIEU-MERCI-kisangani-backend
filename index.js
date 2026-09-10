@@ -21,6 +21,7 @@ const MONGO_URI = process.env.MONGO_URI;
 // ====== Use Routes ======
 app.use("/api/products", require("./routes/products"));
 app.use("/api/sales", require("./routes/sales"));
+app.use("/api/reports", require("./routes/reports"));
 app.use("/api/customers", require("./routes/customers"));
 app.use("/api/auth", require("./routes/auth"));
 app.use("/api/users", require("./routes/users"));

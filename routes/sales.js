@@ -8,8 +8,11 @@ const Product = require("../models/Product");
 const authMiddleware = require("../middleware/auth");
 const { WALKIN_CUSTOMER_NAME, WALKIN_CUSTOMER_PHONE, resolveSaleCustomer } = require("../utils/walkInCustomer");
 const { VALID_REGION_CODES } = require("../utils/regions");
-const { buildCanonicalSaleItem, buildEditedSaleItem, calculateRegionTotal, calculateSaleFinancials, allocateSaleFinancialsToItems } = require("../utils/saleIntegrity");
+const { buildCanonicalSaleItem, buildEditedSaleItem, calculateSaleFinancials, allocateSaleFinancialsToItems } = require("../utils/saleIntegrity");
 const { aggregateItemQuantities, calculateStockDeltas } = require("../utils/saleMutations");
+const reportingDate = require("../utils/reportingDate");
+const { buildTimeframeFilter, getTimeframeDescription, getTodayKisangani } = reportingDate;
+const { scopedRevenueExpression, buildPagedFacet } = require("../utils/reportingPipelines");
 
 class MutationError extends Error {
   constructor(status, message) {
@@ -73,299 +76,106 @@ async function updateCustomerData(customerData, session = null) {
 
 // Helper function to recalculate customer statistics (FIXED)
 async function recalculateCustomerStats(customerId, session = null) {
-  try {
-    // FIX: Only include completed sales (exclude voided and corrected)
-    let salesQuery = Sale.find({
-      customerId: customerId,
-      status: { $in: ["completed", "pending", undefined, null] } // Only valid sales
-    })
-    .sort({ createdAt: 1 })
-    .select('total status type createdAt') // Only select needed fields
-    .lean();
-    if (session) salesQuery = salesQuery.session(session);
-    const sales = await salesQuery;
-    
-    // Additional safety filter
-    const validSales = sales.filter(sale => 
-      sale.status !== "voided" && sale.status !== "corrected" && sale.type !== "expense"
-    );
-    
-    if (validSales.length === 0) {
-      await Customer.findByIdAndUpdate(customerId, {
-        totalPurchases: 0,
-        totalSpent: 0,
-        firstPurchaseDate: null,
-        lastPurchaseDate: null,
-      }, { session });
-      return;
-    }
-    
-    const totalPurchases = validSales.length;
-    const totalSpent = validSales.reduce((sum, sale) => sum + sale.total, 0);
-    const firstPurchaseDate = validSales[0].createdAt;
-    const lastPurchaseDate = validSales[validSales.length - 1].createdAt;
-
-    await Customer.findByIdAndUpdate(customerId, {
-      totalPurchases,
-      totalSpent,
-      firstPurchaseDate,
-      lastPurchaseDate,
-    });
-  } catch (error) {
-    console.error("Error recalculating customer stats:", error);
-    throw error;
-  }
-}
-
-// ==================== TIME FRAME HELPER FUNCTIONS ====================
-
-// Kisangani (DRC) is permanently UTC+2 — no daylight saving time
-const KIS_OFFSET = '+02:00';
-
-/**
- * Returns today's date string (YYYY-MM-DD) in Kisangani local time (UTC+2).
- */
-function getTodayKisangani() {
-  const now = new Date();
-  const local = new Date(now.getTime() + 2 * 60 * 60 * 1000);
-  return local.toISOString().split('T')[0];
-}
-
-/**
- * Parse a YYYY-MM-DD string into a Date whose boundary (start or end of day)
- * is expressed in Kisangani local time (UTC+2), regardless of server timezone.
- */
-function parseDate(dateStr, isEndDate = false) {
-  if (!dateStr) return null;
-
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
-    throw new Error(`Invalid date format: ${dateStr}. Use YYYY-MM-DD format.`);
-  }
-
-  const time = isEndDate ? '23:59:59.999' : '00:00:00.000';
-  const date = new Date(`${dateStr}T${time}${KIS_OFFSET}`);
-
-  if (isNaN(date.getTime())) {
-    throw new Error(`Invalid date: ${dateStr}`);
-  }
-
-  return date;
-}
-
-/**
- * Build date range filter based on timeframe parameters
- * Follows priority: custom range > specific day > month > year > today
- * @param {Object} query - Request query parameters
- * @returns {Object} MongoDB date filter { createdAt: { $gte, $lte } }
- */
-function buildTimeframeFilter(query) {
-  const { from, to, date, year, month } = query;
-  
-  // Priority 1: Custom date range (from and to)
-  if (from || to) {
-    const startDate = from ? parseDate(from, false) : new Date(0); // Beginning of time
-    const endDate = to ? parseDate(to, true) : new Date(); // Current date/time
-    
-    if (from && to && startDate > endDate) {
-      throw new Error("Start date (from) must be before or equal to end date (to)");
-    }
-    
-    return {
-      createdAt: {
-        $gte: startDate,
-        $lte: endDate
-      }
-    };
-  }
-  
-  // Priority 2: Specific day
-  if (date) {
-    return {
-      createdAt: {
-        $gte: parseDate(date, false),
-        $lte: parseDate(date, true)
-      }
-    };
-  }
-
-  // Priority 3: Specific month
-  if (year && month) {
-    const yearNum = parseInt(year, 10);
-    const monthNum = parseInt(month, 10); // 1-indexed (1=Jan … 12=Dec)
-
-    if (isNaN(yearNum) || yearNum < 2000 || yearNum > 2100) {
-      throw new Error(`Invalid year: ${year}. Must be between 2000-2100.`);
-    }
-    if (isNaN(monthNum) || monthNum < 1 || monthNum > 12) {
-      throw new Error(`Invalid month: ${month}. Must be between 01-12.`);
-    }
-
-    const mm = String(monthNum).padStart(2, '0');
-    const lastDay = new Date(yearNum, monthNum, 0).getDate(); // day 0 of next month
-    const dd = String(lastDay).padStart(2, '0');
-
-    return {
-      createdAt: {
-        $gte: new Date(`${yearNum}-${mm}-01T00:00:00.000${KIS_OFFSET}`),
-        $lte: new Date(`${yearNum}-${mm}-${dd}T23:59:59.999${KIS_OFFSET}`)
-      }
-    };
-  }
-
-  // Priority 4: Full year
-  if (year) {
-    const yearNum = parseInt(year, 10);
-
-    if (isNaN(yearNum) || yearNum < 2000 || yearNum > 2100) {
-      throw new Error(`Invalid year: ${year}. Must be between 2000-2100.`);
-    }
-
-    return {
-      createdAt: {
-        $gte: new Date(`${yearNum}-01-01T00:00:00.000${KIS_OFFSET}`),
-        $lte: new Date(`${yearNum}-12-31T23:59:59.999${KIS_OFFSET}`)
-      }
-    };
-  }
-
-  // Priority 5: Default to today in Kisangani time
-  const todayStr = getTodayKisangani();
-  return {
-    createdAt: {
-      $gte: new Date(`${todayStr}T00:00:00.000${KIS_OFFSET}`),
-      $lte: new Date(`${todayStr}T23:59:59.999${KIS_OFFSET}`)
-    }
+  const pipeline = [
+    { $match: {
+      customerId: new mongoose.Types.ObjectId(customerId),
+      status: { $in: ["completed", "pending", null] },
+      type: { $in: ["sale", "reservation"] },
+    } },
+    { $group: {
+      _id: null,
+      totalPurchases: { $sum: 1 },
+      totalSpent: { $sum: { $ifNull: ["$total", 0] } },
+      firstPurchaseDate: { $min: "$createdAt" },
+      lastPurchaseDate: { $max: "$createdAt" },
+    } },
+  ];
+  let aggregate = Sale.aggregate(pipeline);
+  if (session) aggregate = aggregate.session(session);
+  const stats = (await aggregate)[0] || {
+    totalPurchases: 0,
+    totalSpent: 0,
+    firstPurchaseDate: null,
+    lastPurchaseDate: null,
   };
+  await Customer.findByIdAndUpdate(customerId, {
+    totalPurchases: stats.totalPurchases,
+    totalSpent: stats.totalSpent,
+    firstPurchaseDate: stats.firstPurchaseDate,
+    lastPurchaseDate: stats.lastPurchaseDate,
+  }, { session });
 }
 
-/**
- * Get human-readable timeframe description
- */
-function getTimeframeDescription(query) {
-  const { from, to, date, year, month } = query;
-  
-  if (from || to) {
-    return `Custom range: ${from || 'Beginning'} to ${to || 'Now'}`;
-  }
-  if (date) {
-    return `Day: ${date}`;
-  }
-  if (year && month) {
-    return `Month: ${year}-${String(month).padStart(2, '0')}`;
-  }
-  if (year) {
-    return `Year: ${year}`;
-  }
-  return 'Today (default)';
-}
 
 // ==================== MAIN SALES ENDPOINT (TIME FRAME PAGINATION) ====================
 
 /** 
  * GET /api/sales
- * Timeframe-based pagination (no numeric pagination)
+ * Timeframe filters with bounded page-based pagination
  * Priority: custom range > specific day > month > year > today (default)
  */
 router.get("/", authMiddleware, async (req, res) => {
   try {
-    const {
-      customerPhone,
-      status,
-      type,
-      region
-    } = req.query;
+    const { customerPhone, customer, status, type, region, paymentMethod, search, edited } = req.query;
+    const { page, limit, skip } = reportingDate.parsePagination(req.query);
+    const timeframeFilter = reportingDate.buildTimeframeFilter(req.query);
+    const filter = { ...timeframeFilter };
+    filter.status = status || { $in: ["completed", "pending", null] };
+    filter.type = type || { $in: ["sale", "reservation"] };
+    if (customerPhone) filter["customer.phone"] = customerPhone;
+    if (paymentMethod) filter.paymentMethod = paymentMethod;
 
-    // Build the main filter object
-    const filter = {};
-    
-    // 1. Apply timeframe filter (priority order handled in buildTimeframeFilter)
-    try {
-      const timeframeFilter = buildTimeframeFilter(req.query);
-      Object.assign(filter, timeframeFilter);
-    } catch (timeframeError) {
-      return res.status(400).json({ 
-        error: timeframeError.message,
-        suggestion: "Use valid date formats: YYYY-MM-DD for dates, YYYY for year, MM for month (01-12)"
-      });
-    }
-    
-    // 2. Apply customer phone filter if provided
-    if (customerPhone) {
-      filter["customer.phone"] = customerPhone;
-    }
-    
-    // 3. Apply status filter if provided, otherwise use default
-    if (status) {
-      filter.status = status;
-    } else {
-      // Default: include completed, pending, and expense statuses
-      filter.status = { $in: ["completed", "pending", "expense"] };
-    }
-    
-    // 4. Apply type filter if provided, otherwise use default
-    if (type) {
-      filter.type = type;
-    } else {
-      // Default: include all types
-      filter.type = { $in: ["sale", "reservation", "expense"] };
-    }
-
-    // 5. Apply region filter if provided (matches any item in that region)
+    const andFilters = [];
     if (region) {
-      if (!VALID_REGION_CODES.includes(region)) {
-        return res.status(400).json({ error: "Invalid region code" });
-      }
+      if (!VALID_REGION_CODES.includes(region)) return res.status(400).json({ error: "Invalid region code" });
+      andFilters.push({ $or: [
+        { "items.regionCode": region },
+        { "items.region": region === "Bbbb" ? "Butembo" : "China" },
+      ] });
     }
+    const term = String(search || customer || "").trim();
+    if (term) {
+      const escaped = term.replace(/[|\\{}()[\]^$+*?.-]/g, "\\$&");
+      const criteria = ["saleId", "saleNumber", "customer.name", "customer.phone", "salesPerson"]
+        .map((field) => ({ [field]: { $regex: escaped, $options: "i" } }));
+      if (mongoose.isValidObjectId(term)) criteria.push({ customerId: new mongoose.Types.ObjectId(term) });
+      andFilters.push({ $or: criteria });
+    }
+    if (edited === "true") {
+      andFilters.push({ $or: [
+        { "editHistory.0": { $exists: true } },
+        { editedBy: { $exists: true, $ne: null } },
+      ] });
+    }
+    if (andFilters.length) filter.$and = andFilters;
 
-    // Execute query - get ALL records within timeframe (no skip/limit)
-    const foundSales = await Sale.find(filter)
-      .select('-__v') // Exclude version key
-      .sort({ createdAt: -1 }) // Newest first as requested
-      .lean();
-    const resolvedSales = await resolveLegacyItemRegions(foundSales);
-    const sales = region
-      ? resolvedSales.filter((sale) => sale.items.some((item) => item.regionCode === region))
-      : resolvedSales;
-    
-    // Get count for metadata
-    const total = sales.length;
-    
-    // Generate timeframe metadata
-    const timeframeDescription = getTimeframeDescription(req.query);
-    const timeframeFilter = buildTimeframeFilter(req.query);
-    
-    // Calculate totals for quick insights
-    const totals = sales.reduce((acc, sale) => {
-      if (sale.type === "expense") {
-        acc.totalExpenses += sale.total;
-        acc.expenseCount += 1;
-      } else {
-        acc.totalRevenue += region ? calculateRegionTotal(sale, region) : sale.total;
-        acc.saleCount += 1;
-      }
-      return acc;
-    }, {
-      totalRevenue: 0,
-      totalExpenses: 0,
-      saleCount: 0,
-      expenseCount: 0
-    });
-    
-    // Prepare response with timeframe metadata
-    const response = {
+    const revenueExpression = scopedRevenueExpression(region);
+    const [facet = {}] = await Sale.aggregate([
+      { $match: filter },
+      buildPagedFacet({ skip, limit, summaryGroup: {
+        _id: null,
+        totalRevenue: { $sum: { $cond: [{ $ne: ["$type", "expense"] }, revenueExpression, 0] } },
+        totalExpenses: { $sum: { $cond: [{ $eq: ["$type", "expense"] }, { $ifNull: ["$total", 0] }, 0] } },
+        saleCount: { $sum: { $cond: [{ $ne: ["$type", "expense"] }, 1, 0] } },
+        expenseCount: { $sum: { $cond: [{ $eq: ["$type", "expense"] }, 1, 0] } },
+      } }),
+    ]).allowDiskUse(true);
+
+    const sales = await resolveLegacyItemRegions(facet.data || []);
+    const total = facet.metadata?.[0]?.totalRecords || 0;
+    const totals = facet.summary?.[0] || {
+      totalRevenue: 0, totalExpenses: 0, saleCount: 0, expenseCount: 0,
+    };
+
+    res.json({
       success: true,
       data: sales,
-      timeframe: {
-        description: timeframeDescription,
-        start: timeframeFilter.createdAt.$gte.toISOString(),
-        end: timeframeFilter.createdAt.$lte.toISOString(),
-        query: {
-          from: req.query.from || null,
-          to: req.query.to || null,
-          date: req.query.date || null,
-          year: req.query.year || null,
-          month: req.query.month || null
-        }
+      timeframe: reportingDate.timeframeMetadata(req.query, timeframeFilter),
+      pagination: {
+        totalRecords: total,
+        totalPages: Math.ceil(total / limit),
+        currentPage: page,
+        limit,
       },
       summary: {
         totalRecords: total,
@@ -373,93 +183,57 @@ router.get("/", authMiddleware, async (req, res) => {
         expenses: totals.totalExpenses,
         net: totals.totalRevenue - totals.totalExpenses,
         salesCount: totals.saleCount,
-        expensesCount: totals.expenseCount
+        expensesCount: totals.expenseCount,
       },
       filtersApplied: {
-        customerPhone: customerPhone || 'none',
-        status: status || 'default (completed, pending, expense)',
-        type: type || 'default (sale, reservation, expense)',
-        region: region || 'all'
+        customerPhone: customerPhone || "none",
+        status: status || "default (completed, pending, legacy-unset)",
+        type: type || "default (sale, reservation)",
+        paymentMethod: paymentMethod || "none",
+        search: term || "none",
+        edited: edited === "true",
+        region: region || "all",
       },
-      // Performance warning for large datasets
-      performanceNote: total > 1000 
-        ? `Large dataset (${total} records). Consider using a more specific timeframe.`
-        : null
-    };
-    
-    res.json(response);
-    
+      performanceNote: null,
+    });
   } catch (error) {
-    console.error("Error fetching sales with timeframe pagination:", error);
-    
-    // Handle specific error types
-    if (error.message.includes("Invalid date format") || 
-        error.message.includes("Invalid year") || 
-        error.message.includes("Invalid month")) {
-      return res.status(400).json({ 
-        error: error.message,
-        validFormats: {
-          date: "YYYY-MM-DD (e.g., 2024-12-25)",
-          month: "year=YYYY&month=MM (e.g., year=2024&month=12)",
-          year: "year=YYYY (e.g., year=2024)",
-          customRange: "from=YYYY-MM-DD&to=YYYY-MM-DD"
-        }
-      });
-    }
-    
-    res.status(500).json({ 
-      error: "Failed to fetch sales",
-      suggestion: "Check your query parameters and try again"
+    console.error("Error fetching paginated sales:", error);
+    const badRequest = /Invalid date|Invalid year|Invalid month|Start date/.test(error.message);
+    res.status(badRequest ? 400 : 500).json({
+      error: badRequest ? error.message : "Failed to fetch sales",
+      suggestion: "Check your query parameters and try again",
     });
   }
 });
 
-// ==================== ALL OTHER ROUTES REMAIN UNCHANGED ====================
-
 /** ---------- DAILY STATS FIRST (before :id) ---------- **/
 router.get("/stats/daily", authMiddleware, async (req, res) => {
   try {
-    const { date } = req.query;
-    const dateStr = date || getTodayKisangani();
-    const startOfDay = new Date(`${dateStr}T00:00:00.000${KIS_OFFSET}`);
-    const endOfDay = new Date(`${dateStr}T23:59:59.999${KIS_OFFSET}`);
-
-    const dailySales = await Sale.aggregate([
-      {
-        $match: {
-          createdAt: { $gte: startOfDay, $lte: endOfDay },
-          // ✅ FIXED: INCLUDE PENDING RESERVATIONS (money already received)
-          status: { $in: ["completed", "pending"] },
-          // ✅ FIXED: INCLUDE BOTH SALES AND RESERVATIONS
-          type: { $in: ["sale", "reservation"] }
-        },
-      },
-      {
-        $group: {
+    const dateStr = req.query.date || getTodayKisangani();
+    const dateFilter = reportingDate.buildTimeframeFilter({ date: dateStr });
+    const { page, limit, skip } = reportingDate.parsePagination(req.query);
+    const [facet = {}] = await Sale.aggregate([
+      { $match: {
+        ...dateFilter,
+        status: { $in: ["completed", "pending", null] },
+        type: { $in: ["sale", "reservation"] },
+      } },
+      { $facet: {
+        summary: [{ $group: {
           _id: null,
           totalSales: { $sum: 1 },
           totalRevenue: { $sum: "$total" },
-          totalItems: { $sum: { $size: "$items" } },
-        },
-      },
+          totalItems: { $sum: { $size: { $ifNull: ["$items", []] } } },
+        } }],
+        sales: [{ $sort: { createdAt: -1, _id: -1 } }, { $skip: skip }, { $limit: limit }, { $project: { __v: 0 } }],
+      } },
     ]);
-
-    // Use timeframe-based query (no limit) for consistency
-    const sales = await Sale.find({
-      createdAt: { $gte: startOfDay, $lte: endOfDay },
-      status: { $in: ["completed", "pending"] },
-      type: { $in: ["sale", "reservation"] }
-    })
-    .sort({ createdAt: -1 })
-    .select('-__v')
-    .lean();
-
+    const summary = facet.summary?.[0] || { totalSales: 0, totalRevenue: 0, totalItems: 0 };
     res.json({
       date: dateStr,
-      totalSales: dailySales[0]?.totalSales || 0,
-      totalRevenue: dailySales[0]?.totalRevenue || 0,
-      totalItems: dailySales[0]?.totalItems || 0,
-      sales,
+      ...summary,
+      sales: facet.sales || [],
+      pagination: { totalRecords: summary.totalSales, totalPages: Math.ceil(summary.totalSales / limit), currentPage: page, limit },
     });
   } catch (error) {
     console.error("Error fetching daily stats:", error);
@@ -660,7 +434,7 @@ router.post("/", authMiddleware, async (req, res) => {
   }
 });
 
-// ==================== MODIFIED ENDPOINTS (REMOVE PAGINATION) ====================
+// ==================== RELATED HISTORY ENDPOINTS ====================
 
 /** ---------- GET EXPENSES (TIME FRAME BASED) ---------- **/
 router.get("/expenses/all", authMiddleware, async (req, res) => {
@@ -689,22 +463,26 @@ router.get("/expenses/all", authMiddleware, async (req, res) => {
       filter.status = status;
     }
 
-    const expenses = await Sale.find(filter)
-      .select('-__v -items') // Expenses don't have items
-      .sort({ createdAt: -1 })
-      .lean();
-
-    const total = expenses.length;
-    const totalAmount = expenses.reduce((sum, expense) => sum + expense.total, 0);
+    const { page, limit, skip } = reportingDate.parsePagination(req.query);
+    const [facet = {}] = await Sale.aggregate([
+      { $match: filter },
+      { $facet: {
+        data: [{ $sort: { createdAt: -1, _id: -1 } }, { $skip: skip }, { $limit: limit }, { $project: { __v: 0, items: 0 } }],
+        summary: [{ $group: { _id: null, totalExpenses: { $sum: 1 }, totalAmount: { $sum: "$total" } } }],
+      } },
+    ]);
+    const expenses = facet.data || [];
+    const summary = facet.summary?.[0] || { totalExpenses: 0, totalAmount: 0 };
 
     res.json({
       success: true,
       data: expenses,
       summary: {
-        totalExpenses: total,
-        totalAmount: totalAmount,
+        totalExpenses: summary.totalExpenses,
+        totalAmount: summary.totalAmount,
         timeframe: getTimeframeDescription(req.query)
-      }
+      },
+      pagination: { totalRecords: summary.totalExpenses, totalPages: Math.ceil(summary.totalExpenses / limit), currentPage: page, limit }
     });
   } catch (error) {
     console.error("Error fetching expenses:", error);
@@ -715,63 +493,60 @@ router.get("/expenses/all", authMiddleware, async (req, res) => {
 /** ---------- GET RESERVATIONS (TIME FRAME BASED) ---------- **/
 router.get("/reservations/all", authMiddleware, async (req, res) => {
   try {
-    const {
-      status,
-      region
-    } = req.query;
-
-    // Build timeframe filter
-    let timeframeFilter;
-    try {
-      timeframeFilter = buildTimeframeFilter(req.query);
-    } catch (timeframeError) {
-      return res.status(400).json({
-        error: timeframeError.message,
-        suggestion: "Use valid date formats: YYYY-MM-DD"
-      });
-    }
-
+    const { status, region, search } = req.query;
+    const { page, limit, skip } = reportingDate.parsePagination(req.query);
+    const timeframeFilter = reportingDate.buildTimeframeFilter(req.query);
     const filter = {
       type: "reservation",
-      ...timeframeFilter
+      status: status && status !== "all" ? status : { $in: ["pending", "completed", null] },
+      ...timeframeFilter,
     };
-
-    if (status) {
-      filter.status = status;
-    }
-
     if (region) {
-      if (!VALID_REGION_CODES.includes(region)) {
-        return res.status(400).json({ error: "Invalid region code" });
-      }
+      if (!VALID_REGION_CODES.includes(region)) return res.status(400).json({ error: "Invalid region code" });
+      filter.$or = [
+        { "items.regionCode": region },
+        { "items.region": region === "Bbbb" ? "Butembo" : "China" },
+      ];
+    }
+    if (search) {
+      const escaped = String(search).replace(/[|\\{}()[\]^$+*?.-]/g, "\\$&");
+      const searchFilter = { $or: [
+        { saleId: { $regex: escaped, $options: "i" } },
+        { "customer.name": { $regex: escaped, $options: "i" } },
+        { "customer.phone": { $regex: escaped, $options: "i" } },
+        { "customer.email": { $regex: escaped, $options: "i" } },
+      ] };
+      filter.$and = [...(filter.$or ? [{ $or: filter.$or }] : []), searchFilter];
+      delete filter.$or;
     }
 
-    const foundReservations = await Sale.find(filter)
-      .select('-__v') // Exclude version key
-      .sort({ createdAt: -1 })
-      .lean();
-    const resolvedReservations = await resolveLegacyItemRegions(foundReservations);
-    const reservations = region
-      ? resolvedReservations.filter((sale) => sale.items.some((item) => item.regionCode === region))
-      : resolvedReservations;
-
-    const total = reservations.length;
-    const pendingCount = reservations.filter(r => r.status === "pending").length;
-    const completedCount = reservations.filter(r => r.status === "completed").length;
-
+    const revenue = scopedRevenueExpression(region);
+    const [facet = {}] = await Sale.aggregate([
+      { $match: filter },
+      buildPagedFacet({ skip, limit, summaryGroup: {
+        _id: null,
+        totalReservations: { $sum: 1 },
+        pending: { $sum: { $cond: [{ $eq: ["$status", "pending"] }, 1, 0] } },
+        completed: { $sum: { $cond: [{ $eq: ["$status", "completed"] }, 1, 0] } },
+        totalValue: { $sum: revenue },
+        itemCount: { $sum: { $size: { $ifNull: ["$items", []] } } },
+      } }),
+    ]).allowDiskUse(true);
+    const data = await resolveLegacyItemRegions(facet.data || []);
+    const total = facet.metadata?.[0]?.totalRecords || 0;
+    const summary = facet.summary?.[0] || {
+      totalReservations: 0, pending: 0, completed: 0, totalValue: 0, itemCount: 0,
+    };
     res.json({
       success: true,
-      data: reservations,
-      summary: {
-        totalReservations: total,
-        pending: pendingCount,
-        completed: completedCount,
-        timeframe: getTimeframeDescription(req.query)
-      }
+      data,
+      pagination: { totalRecords: total, totalPages: Math.ceil(total / limit), currentPage: page, limit },
+      summary: { ...summary, timeframe: getTimeframeDescription(req.query) },
     });
   } catch (error) {
     console.error("Error fetching reservations:", error);
-    res.status(500).json({ error: "Failed to fetch reservations" });
+    res.status(/Invalid date|Invalid year|Invalid month|Start date/.test(error.message) ? 400 : 500)
+      .json({ error: /Invalid/.test(error.message) ? error.message : "Failed to fetch reservations" });
   }
 });
 

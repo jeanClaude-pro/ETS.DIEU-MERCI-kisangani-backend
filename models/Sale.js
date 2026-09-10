@@ -236,6 +236,10 @@ saleSchema.index({ "customer.phone": 1 }); // Keep this explicit index
 saleSchema.index({ salesPerson: 1 });
 saleSchema.index({ type: 1 }); // Add index for type (sale/reservation/expense)
 saleSchema.index({ status: 1 });
+// Reporting: equality matches on type/status followed by deterministic date sorting.
+saleSchema.index({ type: 1, status: 1, createdAt: -1, _id: -1 });
+// Customer-stat recalculation: one customer's valid purchases in date order.
+saleSchema.index({ customerId: 1, status: 1, createdAt: 1 });
 
 // Pre-save middleware to calculate item totals (only for sales with items)
 saleSchema.pre("save", function(next) {

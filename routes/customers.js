@@ -3,6 +3,8 @@ const router = express.Router();
 const Customer = require("../models/Customer");
 const Sale = require("../models/Sale"); // Make sure to import Sale model
 const { ensureWalkInCustomer } = require("../utils/walkInCustomer");
+const mongoose = require("mongoose");
+const { parsePagination } = require("../utils/reportingDate");
 
 // GET /api/customers/walkin - Get the permanent system Walk-in Customer
 // (created lazily here as a fallback in case the startup bootstrap hasn't run)
@@ -21,7 +23,8 @@ router.get("/walkin", async (req, res) => {
 // customer to manage; pass includeWalkIn=true to include it.
 router.get("/", async (req, res) => {
   try {
-    const { page = 1, limit = 50, search, includeWalkIn } = req.query;
+    const { search, includeWalkIn } = req.query;
+    const { page, limit, skip } = parsePagination(req.query);
 
     // Build filter object
     const filter = {};
@@ -30,25 +33,37 @@ router.get("/", async (req, res) => {
     }
 
     if (search) {
+      const escapedSearch = String(search).replace(/[|\\{}()[\]^$+*?.-]/g, "\\$&");
       filter.$or = [
-        { name: { $regex: search, $options: "i" } },
-        { phone: { $regex: search, $options: "i" } },
-        { email: { $regex: search, $options: "i" } }
+        { name: { $regex: escapedSearch, $options: "i" } },
+        { phone: { $regex: escapedSearch, $options: "i" } },
+        { email: { $regex: escapedSearch, $options: "i" } }
       ];
     }
     
-    const customers = await Customer.find(filter)
-      .sort({ totalSpent: -1, lastPurchaseDate: -1 })
-      .limit(limit * 1)
-      .skip((page - 1) * limit);
-    
-    const total = await Customer.countDocuments(filter);
+    const [facet = {}] = await Customer.aggregate([
+      { $match: filter },
+      { $facet: {
+        customers: [{ $sort: { totalSpent: -1, lastPurchaseDate: -1, _id: 1 } }, { $skip: skip }, { $limit: limit }],
+        metadata: [{ $count: "total" }],
+        summary: [{ $group: {
+          _id: null,
+          totalSpent: { $sum: "$totalSpent" },
+          totalPurchases: { $sum: "$totalPurchases" },
+          activeCustomers: { $sum: { $cond: [{ $gt: [{ $ifNull: ["$totalSpent", 0] }, 0] }, 1, 0] } },
+        } }],
+      } },
+    ]);
+    const customers = facet.customers || [];
+    const total = facet.metadata?.[0]?.total || 0;
     
     res.json({
       customers,
       totalPages: Math.ceil(total / limit),
       currentPage: page,
-      total
+      total,
+      limit,
+      summary: facet.summary?.[0] || { totalSpent: 0, totalPurchases: 0, activeCustomers: 0 }
     });
   } catch (error) {
     console.error("Error fetching customers:", error);
@@ -94,52 +109,34 @@ router.get("/phone/:phone", async (req, res) => {
 });
 
 // POST /api/customers/:id/recalculate - Recalculate customer statistics
-// POST /api/customers/:id/recalculate - Recalculate customer statistics
 router.post("/:id/recalculate", async (req, res) => {
   try {
     const customerId = req.params.id;
     
-    // FIX: Only get COMPLETED sales (exclude voided and corrected sales)
-    const sales = await Sale.find({ 
-      customerId: customerId,
-      status: { $in: ["completed", "pending", undefined] } // Include completed, pending, or sales without status
-    }).sort({ createdAt: 1 });
-    
-    // FIX: Also filter out voided sales manually for safety
-    const validSales = sales.filter(sale => 
-      sale.status !== "voided" && sale.status !== "corrected"
-    );
-    
-    if (validSales.length === 0) {
-      // If no valid sales, reset the customer stats
-      const updatedCustomer = await Customer.findByIdAndUpdate(
-        customerId,
-        {
-          totalPurchases: 0,
-          totalSpent: 0,
-          firstPurchaseDate: null,
-          lastPurchaseDate: null,
-        },
-        { new: true }
-      );
-      
-      return res.json(updatedCustomer);
-    }
-    
-    // Recalculate totals from VALID sales only
-    const totalPurchases = validSales.length;
-    const totalSpent = validSales.reduce((sum, sale) => sum + sale.total, 0);
-    const firstPurchaseDate = validSales[0].createdAt;
-    const lastPurchaseDate = validSales[validSales.length - 1].createdAt;
+    if (!mongoose.isValidObjectId(customerId)) return res.status(400).json({ error: "Invalid customer ID" });
+    const [stats = {}] = await Sale.aggregate([
+      { $match: {
+        customerId: new mongoose.Types.ObjectId(customerId),
+        status: { $in: ["completed", "pending", null] },
+        type: { $in: ["sale", "reservation"] },
+      } },
+      { $group: {
+        _id: null,
+        totalPurchases: { $sum: 1 },
+        totalSpent: { $sum: { $ifNull: ["$total", 0] } },
+        firstPurchaseDate: { $min: "$createdAt" },
+        lastPurchaseDate: { $max: "$createdAt" },
+      } },
+    ]);
 
     // Update customer
     const updatedCustomer = await Customer.findByIdAndUpdate(
       customerId,
       {
-        totalPurchases,
-        totalSpent,
-        firstPurchaseDate,
-        lastPurchaseDate,
+        totalPurchases: stats.totalPurchases || 0,
+        totalSpent: stats.totalSpent || 0,
+        firstPurchaseDate: stats.firstPurchaseDate || null,
+        lastPurchaseDate: stats.lastPurchaseDate || null,
       },
       { new: true }
     );

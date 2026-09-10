@@ -4,130 +4,9 @@ const mongoose = require("mongoose");
 const Entry = require("../models/Entry");
 const authMiddleware = require("../middleware/auth");
 const { isValidRegionPair } = require("../utils/regions");
+const reportingDate = require("../utils/reportingDate");
+const { buildTimeframeFilter, getTimeframeDescription, getTodayKisangani } = reportingDate;
 
-// ==================== TIME FRAME HELPER FUNCTIONS ====================
-
-// Kisangani (DRC) is permanently UTC+2 — no daylight saving time
-const KIS_OFFSET = '+02:00';
-
-function getTodayKisangani() {
-  const now = new Date();
-  const local = new Date(now.getTime() + 2 * 60 * 60 * 1000);
-  return local.toISOString().split('T')[0];
-}
-
-function parseDate(dateStr, isEndDate = false) {
-  if (!dateStr) return null;
-
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
-    throw new Error(`Invalid date format: ${dateStr}. Use YYYY-MM-DD format.`);
-  }
-
-  const time = isEndDate ? '23:59:59.999' : '00:00:00.000';
-  const date = new Date(`${dateStr}T${time}${KIS_OFFSET}`);
-
-  if (isNaN(date.getTime())) {
-    throw new Error(`Invalid date: ${dateStr}`);
-  }
-
-  return date;
-}
-
-function buildTimeframeFilter(query) {
-  const { from, to, date, year, month } = query;
-
-  // Priority 1: Custom date range
-  if (from || to) {
-    const startDate = from ? parseDate(from, false) : new Date(0);
-    const endDate = to ? parseDate(to, true) : new Date();
-
-    if (from && to && startDate > endDate) {
-      throw new Error("Start date (from) must be before or equal to end date (to)");
-    }
-
-    return { createdAt: { $gte: startDate, $lte: endDate } };
-  }
-
-  // Priority 2: Specific day
-  if (date) {
-    return {
-      createdAt: {
-        $gte: parseDate(date, false),
-        $lte: parseDate(date, true)
-      }
-    };
-  }
-
-  // Priority 3: Specific month
-  if (year && month) {
-    const yearNum = parseInt(year, 10);
-    const monthNum = parseInt(month, 10); // 1-indexed
-
-    if (isNaN(yearNum) || yearNum < 2000 || yearNum > 2100) {
-      throw new Error(`Invalid year: ${year}. Must be between 2000-2100.`);
-    }
-    if (isNaN(monthNum) || monthNum < 1 || monthNum > 12) {
-      throw new Error(`Invalid month: ${month}. Must be between 01-12.`);
-    }
-
-    const mm = String(monthNum).padStart(2, '0');
-    const lastDay = new Date(yearNum, monthNum, 0).getDate();
-    const dd = String(lastDay).padStart(2, '0');
-
-    return {
-      createdAt: {
-        $gte: new Date(`${yearNum}-${mm}-01T00:00:00.000${KIS_OFFSET}`),
-        $lte: new Date(`${yearNum}-${mm}-${dd}T23:59:59.999${KIS_OFFSET}`)
-      }
-    };
-  }
-
-  // Priority 4: Full year
-  if (year) {
-    const yearNum = parseInt(year, 10);
-
-    if (isNaN(yearNum) || yearNum < 2000 || yearNum > 2100) {
-      throw new Error(`Invalid year: ${year}. Must be between 2000-2100.`);
-    }
-
-    return {
-      createdAt: {
-        $gte: new Date(`${yearNum}-01-01T00:00:00.000${KIS_OFFSET}`),
-        $lte: new Date(`${yearNum}-12-31T23:59:59.999${KIS_OFFSET}`)
-      }
-    };
-  }
-
-  // Priority 5: Default to today in Kisangani time
-  const todayStr = getTodayKisangani();
-  return {
-    createdAt: {
-      $gte: new Date(`${todayStr}T00:00:00.000${KIS_OFFSET}`),
-      $lte: new Date(`${todayStr}T23:59:59.999${KIS_OFFSET}`)
-    }
-  };
-}
-
-/**
- * Get human-readable timeframe description
- */
-function getTimeframeDescription(query) {
-  const { from, to, date, year, month } = query;
-  
-  if (from || to) {
-    return `Custom range: ${from || 'Beginning'} to ${to || 'Now'}`;
-  }
-  if (date) {
-    return `Day: ${date}`;
-  }
-  if (year && month) {
-    return `Month: ${year}-${String(month).padStart(2, '0')}`;
-  }
-  if (year) {
-    return `Year: ${year}`;
-  }
-  return 'Today (default)';
-}
 
 // Normalize payment method (same as your sales route)
 function normalizePaymentMethod(pm) {
@@ -142,11 +21,33 @@ function normalizePaymentMethod(pm) {
   return "other";
 }
 
+async function getPagedEntriesWithSummary(filter, query) {
+  const { page, limit, skip } = reportingDate.parsePagination(query);
+  const [facet = {}] = await Entry.aggregate([
+    { $match: filter },
+    { $facet: {
+      entries: [
+        { $sort: { createdAt: -1, _id: -1 } }, { $skip: skip }, { $limit: limit },
+        { $lookup: { from: "users", localField: "createdBy", foreignField: "_id", as: "createdByUser" } },
+        { $set: { createdBy: { $ifNull: [{ $first: "$createdByUser" }, "$createdBy"] } } },
+        { $project: { __v: 0, createdByUser: 0, "createdBy.password": 0 } },
+      ],
+      summary: [{ $group: { _id: null, count: { $sum: 1 }, totalAmount: { $sum: "$amount" }, averageAmount: { $avg: "$amount" } } }],
+    } },
+  ]);
+  const summary = facet.summary?.[0] || { count: 0, totalAmount: 0, averageAmount: 0 };
+  return {
+    entries: facet.entries || [],
+    summary,
+    pagination: { totalRecords: summary.count, totalPages: Math.ceil(summary.count / limit), currentPage: page, limit },
+  };
+}
+
 // ==================== MAIN ENTRIES ENDPOINT (TIME FRAME PAGINATION) ====================
 
 /** 
  * GET /api/entries
- * Timeframe-based pagination (no numeric pagination)
+ * Timeframe filters with bounded page-based pagination
  * Priority: custom range > specific day > month > year > today (default)
  */
 router.get("/", authMiddleware, async (req, res) => {
@@ -157,7 +58,8 @@ router.get("/", authMiddleware, async (req, res) => {
       status,
       search,
       createdBy,
-      region
+      region,
+      edited
     } = req.query;
     
     // Build the main filter object
@@ -201,70 +103,72 @@ router.get("/", authMiddleware, async (req, res) => {
     
     // 5. Apply createdBy filter if provided
     if (createdBy) {
-      filter.createdBy = createdBy;
+      if (!mongoose.isValidObjectId(createdBy)) return res.status(400).json({ error: "Invalid createdBy ID" });
+      filter.createdBy = new mongoose.Types.ObjectId(createdBy);
     }
     
     // 6. Apply search filter if provided
     if (search) {
+      const escapedSearch = String(search).replace(/[|\\{}()[\]^$+*?.-]/g, "\\$&");
       filter.$or = [
-        { entryId: { $regex: search, $options: "i" } },
-        { source: { $regex: search, $options: "i" } },
-        { category: { $regex: search, $options: "i" } },
-        { description: { $regex: search, $options: "i" } }
+        { entryId: { $regex: escapedSearch, $options: "i" } },
+        { source: { $regex: escapedSearch, $options: "i" } },
+        { category: { $regex: escapedSearch, $options: "i" } },
+        { description: { $regex: escapedSearch, $options: "i" } }
       ];
     }
 
     // 7. Apply region filter if provided
     if (region) {
+      if (!["Bbbb", "Cnnn"].includes(region)) return res.status(400).json({ error: "Invalid region code" });
       filter.regionCode = region;
     }
+    if (edited === "true") filter["editHistory.0"] = { $exists: true };
 
-    // Execute query - get ALL records within timeframe (no skip/limit)
-    const entries = await Entry.find(filter)
-      .populate("createdBy", "username email")
-      .populate("updatedBy", "username")
-      .select('-__v') // Exclude version key
-      .sort({ createdAt: -1 }) // Newest first
-      .lean();
-
-    // Get count for metadata
-    const total = entries.length;
+    const { page, limit, skip } = reportingDate.parsePagination(req.query);
+    const [facet = {}] = await Entry.aggregate([
+      { $match: filter },
+      { $facet: {
+        data: [
+          { $sort: { createdAt: -1, _id: -1 } }, { $skip: skip }, { $limit: limit },
+          { $lookup: { from: "users", localField: "createdBy", foreignField: "_id", as: "createdByUser" } },
+          { $lookup: { from: "users", localField: "updatedBy", foreignField: "_id", as: "updatedByUser" } },
+          { $set: {
+            createdBy: { $ifNull: [{ $first: "$createdByUser" }, "$createdBy"] },
+            updatedBy: { $ifNull: [{ $first: "$updatedByUser" }, "$updatedBy"] },
+          } },
+          { $project: { __v: 0, createdByUser: 0, updatedByUser: 0, "createdBy.password": 0, "updatedBy.password": 0 } },
+        ],
+        metadata: [{ $count: "totalRecords" }],
+        totals: [{ $group: {
+          _id: null,
+          totalAmount: { $sum: "$amount" },
+          activeCount: { $sum: { $cond: [{ $eq: ["$status", "active"] }, 1, 0] } },
+          activeAmount: { $sum: { $cond: [{ $eq: ["$status", "active"] }, "$amount", 0] } },
+          deletedCount: { $sum: { $cond: [{ $eq: ["$status", "deleted"] }, 1, 0] } },
+          deletedAmount: { $sum: { $cond: [{ $eq: ["$status", "deleted"] }, "$amount", 0] } },
+        } }],
+        categories: [{ $group: { _id: "$category", amount: { $sum: "$amount" } } }],
+        paymentMethods: [{ $group: { _id: "$paymentMethod", amount: { $sum: "$amount" } } }],
+      } },
+    ]).allowDiskUse(true);
+    const entries = facet.data || [];
+    const total = facet.metadata?.[0]?.totalRecords || 0;
 
     // Generate timeframe metadata
     const timeframeDescription = getTimeframeDescription(req.query);
     const timeframeFilter = buildTimeframeFilter(req.query);
 
-    // Calculate totals for quick insights
-    const totals = entries.reduce((acc, entry) => {
-      acc.totalAmount += entry.amount;
-      
-      // Count by status
-      if (entry.status === "active") {
-        acc.activeCount += 1;
-        acc.activeAmount += entry.amount;
-      } else if (entry.status === "deleted") {
-        acc.deletedCount += 1;
-        acc.deletedAmount += entry.amount;
-      }
-      
-      // Count by payment method
-      acc.paymentMethods[entry.paymentMethod] = 
-        (acc.paymentMethods[entry.paymentMethod] || 0) + entry.amount;
-      
-      // Count by category
-      acc.categories[entry.category] = 
-        (acc.categories[entry.category] || 0) + entry.amount;
-      
-      return acc;
-    }, {
+    const totals = {
       totalAmount: 0,
       activeCount: 0,
       activeAmount: 0,
       deletedCount: 0,
       deletedAmount: 0,
-      paymentMethods: {},
-      categories: {}
-    });
+      ...(facet.totals?.[0] || {}),
+      paymentMethods: Object.fromEntries((facet.paymentMethods || []).map((row) => [row._id, row.amount])),
+      categories: Object.fromEntries((facet.categories || []).map((row) => [row._id, row.amount])),
+    };
 
     // Prepare response with timeframe metadata
     const response = {
@@ -296,6 +200,7 @@ router.get("/", authMiddleware, async (req, res) => {
         categories: totals.categories,
         paymentMethods: totals.paymentMethods
       },
+      pagination: { totalRecords: total, totalPages: Math.ceil(total / limit), currentPage: page, limit },
       filtersApplied: {
         status: status || 'default (active only)',
         category: category || 'none',
@@ -688,63 +593,31 @@ router.patch("/:id/restore", authMiddleware, async (req, res) => {
 /** ---------- DAILY ENTRY STATS (like your sales stats) ---------- */
 router.get("/stats/daily", authMiddleware, async (req, res) => {
   try {
-    const { date } = req.query;
-    const dateStr = date || getTodayKisangani();
-    const startOfDay = new Date(`${dateStr}T00:00:00.000${KIS_OFFSET}`);
-    const endOfDay = new Date(`${dateStr}T23:59:59.999${KIS_OFFSET}`);
-
-    const dailyEntries = await Entry.aggregate([
-      {
-        $match: {
-          createdAt: { $gte: startOfDay, $lte: endOfDay },
-          status: "active"
-        },
-      },
-      {
-        $group: {
-          _id: null,
-          totalEntries: { $sum: 1 },
-          totalAmount: { $sum: "$amount" },
-          // Group by category
-          categories: {
-            $push: {
-              category: "$category",
-              amount: "$amount"
-            }
-          }
-        },
-      },
+    const dateStr = req.query.date || getTodayKisangani();
+    const dateFilter = buildTimeframeFilter({ date: dateStr });
+    const { page, limit, skip } = reportingDate.parsePagination(req.query);
+    const [facet = {}] = await Entry.aggregate([
+      { $match: { ...dateFilter, status: "active" } },
+      { $facet: {
+        summary: [{ $group: { _id: null, totalEntries: { $sum: 1 }, totalAmount: { $sum: "$amount" } } }],
+        categories: [{ $group: { _id: "$category", amount: { $sum: "$amount" } } }],
+        paymentMethods: [{ $group: { _id: "$paymentMethod", amount: { $sum: "$amount" } } }],
+        entries: [
+          { $sort: { createdAt: -1, _id: -1 } }, { $skip: skip }, { $limit: limit },
+          { $lookup: { from: "users", localField: "createdBy", foreignField: "_id", as: "createdByUser" } },
+          { $set: { createdBy: { $ifNull: [{ $first: "$createdByUser" }, "$createdBy"] } } },
+          { $project: { __v: 0, createdByUser: 0, "createdBy.password": 0 } },
+        ],
+      } },
     ]);
-
-    const entries = await Entry.find({
-      createdAt: { $gte: startOfDay, $lte: endOfDay },
-      status: "active"
-    })
-    .populate("createdBy", "username email")
-    .sort({ createdAt: -1 })
-    .lean();
-
-    // Calculate category breakdown
-    const categoryBreakdown = {};
-    if (dailyEntries[0]?.categories) {
-      dailyEntries[0].categories.forEach(item => {
-        categoryBreakdown[item.category] = (categoryBreakdown[item.category] || 0) + item.amount;
-      });
-    }
-
-    // Calculate payment method breakdown
-    const paymentMethodBreakdown = entries.reduce((acc, entry) => {
-      acc[entry.paymentMethod] = (acc[entry.paymentMethod] || 0) + entry.amount;
-      return acc;
-    }, {});
-
+    const summary = facet.summary?.[0] || { totalEntries: 0, totalAmount: 0 };
     res.json({
-      date: targetDate.toISOString().split("T")[0],
-      totalEntries: dailyEntries[0]?.totalEntries || 0,
-      totalAmount: dailyEntries[0]?.totalAmount || 0,
-      categoryBreakdown,
-      paymentMethodBreakdown,
-      entries,
+      date: dateStr,
+      ...summary,
+      categoryBreakdown: Object.fromEntries((facet.categories || []).map((row) => [row._id, row.amount])),
+      paymentMethodBreakdown: Object.fromEntries((facet.paymentMethods || []).map((row) => [row._id, row.amount])),
+      entries: facet.entries || [],
+      pagination: { totalRecords: summary.totalEntries, totalPages: Math.ceil(summary.totalEntries / limit), currentPage: page, limit },
     });
   } catch (error) {
     console.error("Error fetching daily entry stats:", error);
@@ -755,145 +628,37 @@ router.get("/stats/daily", authMiddleware, async (req, res) => {
 /** ---------- GET ENTRY STATISTICS WITH TIMEFRAME FILTERING ---------- */
 router.get("/stats/summary", authMiddleware, async (req, res) => {
   try {
-    // Build timeframe filter
-    let timeframeFilter;
-    try {
-      timeframeFilter = buildTimeframeFilter(req.query);
-    } catch (timeframeError) {
-      return res.status(400).json({ 
-        error: timeframeError.message,
-        suggestion: "Use valid date formats: YYYY-MM-DD"
-      });
-    }
-
-    // Add status filter (active only for stats)
-    timeframeFilter.status = "active";
-
-    const stats = await Entry.aggregate([
+    const timeframeFilter = { ...buildTimeframeFilter(req.query), status: "active" };
+    const [facet = {}] = await Entry.aggregate([
       { $match: timeframeFilter },
-      {
-        $group: {
-          _id: null,
-          totalEntries: { $sum: 1 },
-          totalAmount: { $sum: "$amount" },
-          avgAmount: { $avg: "$amount" },
-          maxAmount: { $max: "$amount" },
-          minAmount: { $min: "$amount" }
-        }
-      }
+      { $facet: {
+        totals: [{ $group: { _id: null, totalEntries: { $sum: 1 }, totalAmount: { $sum: "$amount" }, avgAmount: { $avg: "$amount" }, maxAmount: { $max: "$amount" }, minAmount: { $min: "$amount" } } }],
+        categories: [{ $group: { _id: "$category", count: { $sum: 1 }, totalAmount: { $sum: "$amount" }, avgAmount: { $avg: "$amount" } } }, { $sort: { totalAmount: -1, _id: 1 } }],
+        sources: [{ $group: { _id: "$source", count: { $sum: 1 }, totalAmount: { $sum: "$amount" }, avgAmount: { $avg: "$amount" } } }, { $sort: { totalAmount: -1, _id: 1 } }],
+        paymentMethods: [{ $group: { _id: "$paymentMethod", count: { $sum: 1 }, totalAmount: { $sum: "$amount" }, avgAmount: { $avg: "$amount" } } }, { $sort: { totalAmount: -1, _id: 1 } }],
+        dailyBreakdown: [{ $group: { _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt", timezone: "Africa/Lubumbashi" } }, count: { $sum: 1 }, totalAmount: { $sum: "$amount" } } }, { $sort: { _id: 1 } }, { $limit: 30 }],
+        topEntries: [{ $sort: { amount: -1, _id: 1 } }, { $limit: 10 }, { $project: { entryId: 1, source: 1, amount: 1, category: 1, paymentMethod: 1, createdAt: 1 } }],
+        frequentSources: [{ $group: { _id: "$source", count: { $sum: 1 }, totalAmount: { $sum: "$amount" }, avgAmount: { $avg: "$amount" } } }, { $sort: { count: -1, _id: 1 } }, { $limit: 10 }],
+      } },
     ]);
-
-    const categoryStats = await Entry.aggregate([
-      { $match: timeframeFilter },
-      {
-        $group: {
-          _id: "$category",
-          count: { $sum: 1 },
-          totalAmount: { $sum: "$amount" },
-          avgAmount: { $avg: "$amount" }
-        }
-      },
-      { $sort: { totalAmount: -1 } }
-    ]);
-
-    const sourceStats = await Entry.aggregate([
-      { $match: timeframeFilter },
-      {
-        $group: {
-          _id: "$source",
-          count: { $sum: 1 },
-          totalAmount: { $sum: "$amount" },
-          avgAmount: { $avg: "$amount" }
-        }
-      },
-      { $sort: { totalAmount: -1 } }
-    ]);
-
-    const paymentMethodStats = await Entry.aggregate([
-      { $match: timeframeFilter },
-      {
-        $group: {
-          _id: "$paymentMethod",
-          count: { $sum: 1 },
-          totalAmount: { $sum: "$amount" },
-          avgAmount: { $avg: "$amount" }
-        }
-      },
-      { $sort: { totalAmount: -1 } }
-    ]);
-
-    // Get daily breakdown for the timeframe
-    const dailyBreakdown = await Entry.aggregate([
-      { $match: timeframeFilter },
-      {
-        $group: {
-          _id: {
-            year: { $year: "$createdAt" },
-            month: { $month: "$createdAt" },
-            day: { $dayOfMonth: "$createdAt" }
-          },
-          date: { $first: "$createdAt" },
-          count: { $sum: 1 },
-          totalAmount: { $sum: "$amount" }
-        }
-      },
-      { $sort: { "_id.year": 1, "_id.month": 1, "_id.day": 1 } },
-      { $limit: 30 } // Limit to last 30 days
-    ]);
-
-    // Get top entries
-    const topEntries = await Entry.find(timeframeFilter)
-      .populate("createdBy", "username email")
-      .sort({ amount: -1 })
-      .limit(10)
-      .select('entryId source amount category paymentMethod createdAt')
-      .lean();
-
-    // Get most frequent sources
-    const frequentSources = await Entry.aggregate([
-      { $match: timeframeFilter },
-      {
-        $group: {
-          _id: "$source",
-          count: { $sum: 1 },
-          totalAmount: { $sum: "$amount" },
-          avgAmount: { $avg: "$amount" }
-        }
-      },
-      { $sort: { count: -1 } },
-      { $limit: 10 }
-    ]);
-
-    // Format the daily breakdown
-    const formattedDailyBreakdown = dailyBreakdown.map(day => ({
-      date: day.date.toISOString().split('T')[0],
-      count: day.count,
-      totalAmount: day.totalAmount
-    }));
-
     res.json({
       timeframe: {
         description: getTimeframeDescription(req.query),
         start: timeframeFilter.createdAt.$gte,
-        end: timeframeFilter.createdAt.$lte
+        end: timeframeFilter.createdAt.$lte,
       },
-      totals: stats[0] || { 
-        totalEntries: 0, 
-        totalAmount: 0, 
-        avgAmount: 0,
-        maxAmount: 0,
-        minAmount: 0
-      },
-      categories: categoryStats,
-      sources: sourceStats,
-      paymentMethods: paymentMethodStats,
-      dailyBreakdown: formattedDailyBreakdown,
-      topEntries: topEntries,
-      frequentSources: frequentSources
+      totals: facet.totals?.[0] || { totalEntries: 0, totalAmount: 0, avgAmount: 0, maxAmount: 0, minAmount: 0 },
+      categories: facet.categories || [],
+      sources: facet.sources || [],
+      paymentMethods: facet.paymentMethods || [],
+      dailyBreakdown: (facet.dailyBreakdown || []).map((day) => ({ date: day._id, count: day.count, totalAmount: day.totalAmount })),
+      topEntries: facet.topEntries || [],
+      frequentSources: facet.frequentSources || [],
     });
   } catch (error) {
     console.error("Error fetching entry statistics:", error);
-    res.status(500).json({ error: "Failed to fetch entry statistics" });
+    res.status(/Invalid date|Invalid year|Invalid month|Start date/.test(error.message) ? 400 : 500)
+      .json({ error: /Invalid/.test(error.message) ? error.message : "Failed to fetch entry statistics" });
   }
 });
 
@@ -917,23 +682,15 @@ router.get("/category/:category", authMiddleware, async (req, res) => {
     timeframeFilter.category = category;
     timeframeFilter.status = "active";
 
-    const entries = await Entry.find(timeframeFilter)
-      .populate("createdBy", "username email")
-      .sort({ createdAt: -1 })
-      .lean();
-
-    const totalAmount = entries.reduce((sum, entry) => sum + entry.amount, 0);
+    const { entries, summary, pagination } = await getPagedEntriesWithSummary(timeframeFilter, req.query);
 
     res.json({
       success: true,
       category: category,
       timeframe: getTimeframeDescription(req.query),
-      summary: {
-        count: entries.length,
-        totalAmount: totalAmount,
-        averageAmount: entries.length > 0 ? totalAmount / entries.length : 0
-      },
-      entries: entries
+      summary,
+      pagination,
+      entries
     });
   } catch (error) {
     console.error("Error fetching entries by category:", error);
@@ -961,23 +718,15 @@ router.get("/source/:source", authMiddleware, async (req, res) => {
     timeframeFilter.source = source;
     timeframeFilter.status = "active";
 
-    const entries = await Entry.find(timeframeFilter)
-      .populate("createdBy", "username email")
-      .sort({ createdAt: -1 })
-      .lean();
-
-    const totalAmount = entries.reduce((sum, entry) => sum + entry.amount, 0);
+    const { entries, summary, pagination } = await getPagedEntriesWithSummary(timeframeFilter, req.query);
 
     res.json({
       success: true,
       source: source,
       timeframe: getTimeframeDescription(req.query),
-      summary: {
-        count: entries.length,
-        totalAmount: totalAmount,
-        averageAmount: entries.length > 0 ? totalAmount / entries.length : 0
-      },
-      entries: entries
+      summary,
+      pagination,
+      entries
     });
   } catch (error) {
     console.error("Error fetching entries by source:", error);
@@ -1005,23 +754,15 @@ router.get("/payment/:method", authMiddleware, async (req, res) => {
     timeframeFilter.paymentMethod = method;
     timeframeFilter.status = "active";
 
-    const entries = await Entry.find(timeframeFilter)
-      .populate("createdBy", "username email")
-      .sort({ createdAt: -1 })
-      .lean();
-
-    const totalAmount = entries.reduce((sum, entry) => sum + entry.amount, 0);
+    const { entries, summary, pagination } = await getPagedEntriesWithSummary(timeframeFilter, req.query);
 
     res.json({
       success: true,
       paymentMethod: method,
       timeframe: getTimeframeDescription(req.query),
-      summary: {
-        count: entries.length,
-        totalAmount: totalAmount,
-        averageAmount: entries.length > 0 ? totalAmount / entries.length : 0
-      },
-      entries: entries
+      summary,
+      pagination,
+      entries
     });
   } catch (error) {
     console.error("Error fetching entries by payment method:", error);
@@ -1044,26 +785,19 @@ router.get("/user/me", authMiddleware, async (req, res) => {
     }
 
     // Add user filter
-    timeframeFilter.createdBy = req.user.userId;
+    if (!mongoose.isValidObjectId(req.user.userId)) return res.status(400).json({ error: "Invalid user ID" });
+    timeframeFilter.createdBy = new mongoose.Types.ObjectId(req.user.userId);
     timeframeFilter.status = "active";
 
-    const entries = await Entry.find(timeframeFilter)
-      .populate("createdBy", "username email")
-      .sort({ createdAt: -1 })
-      .lean();
-
-    const totalAmount = entries.reduce((sum, entry) => sum + entry.amount, 0);
+    const { entries, summary, pagination } = await getPagedEntriesWithSummary(timeframeFilter, req.query);
 
     res.json({
       success: true,
       userId: req.user.userId,
       timeframe: getTimeframeDescription(req.query),
-      summary: {
-        count: entries.length,
-        totalAmount: totalAmount,
-        averageAmount: entries.length > 0 ? totalAmount / entries.length : 0
-      },
-      entries: entries
+      summary,
+      pagination,
+      entries
     });
   } catch (error) {
     console.error("Error fetching user's entries:", error);

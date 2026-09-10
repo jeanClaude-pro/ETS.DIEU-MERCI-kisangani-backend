@@ -72,5 +72,7 @@ const expenseSchema = new mongoose.Schema({
 expenseSchema.index({ createdAt: -1 });
 expenseSchema.index({ status: 1 });
 expenseSchema.index({ recordedBy: 1 });
+// Net-income and history queries match validation status before date sorting.
+expenseSchema.index({ status: 1, createdAt: -1, _id: -1 });
 
 module.exports = mongoose.model("Expense", expenseSchema);

@@ -116,5 +116,7 @@ entrySchema.index({ status: 1 });
 entrySchema.index({ category: 1 });
 entrySchema.index({ "receivedFrom.phone": 1 });
 entrySchema.index({ source: 1 });
+// Active/deleted cash-entry reports are bounded and sorted by reporting date.
+entrySchema.index({ status: 1, createdAt: -1, _id: -1 });
 
 module.exports = mongoose.model("Entry", entrySchema);

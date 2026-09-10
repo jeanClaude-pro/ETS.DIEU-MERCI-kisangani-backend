@@ -4,6 +4,31 @@ const Expense = require("../models/Expense");
 const authMiddleware = require("../middleware/auth");
 const nodemailer = require("nodemailer");
 const { isValidRegionPair } = require("../utils/regions");
+const reportingDate = require("../utils/reportingDate");
+const { buildTimeframeFilter, getTimeframeDescription } = reportingDate;
+
+async function getPagedExpensesWithSummary(filter, query) {
+  const { page, limit, skip } = reportingDate.parsePagination(query);
+  const [facet = {}] = await Expense.aggregate([
+    { $match: filter },
+    { $facet: {
+      expenses: [{ $sort: { createdAt: -1, _id: -1 } }, { $skip: skip }, { $limit: limit }, { $project: { __v: 0 } }],
+      summary: [{ $group: {
+        _id: null,
+        count: { $sum: 1 },
+        totalAmount: { $sum: "$amount" },
+        averageAmount: { $avg: "$amount" },
+        validatedCount: { $sum: { $cond: [{ $eq: ["$status", "validated"] }, 1, 0] } },
+        validatedAmount: { $sum: { $cond: [{ $eq: ["$status", "validated"] }, "$amount", 0] } },
+      } }],
+    } },
+  ]);
+  const summary = facet.summary?.[0] || { count: 0, totalAmount: 0, averageAmount: 0, validatedCount: 0, validatedAmount: 0 };
+  return {
+    expenses: facet.expenses || [], summary,
+    pagination: { totalRecords: summary.count, totalPages: Math.ceil(summary.count / limit), currentPage: page, limit },
+  };
+}
 
 // ✅ CREATE EMAIL TRANSPORTER
 const transporter = nodemailer.createTransport({
@@ -16,152 +41,6 @@ const transporter = nodemailer.createTransport({
   },
 });
 
-// ==================== TIME FRAME HELPER FUNCTIONS ====================
-
-/**
- * Parse date string and set appropriate time boundaries
- * @param {string} dateStr - Date in YYYY-MM-DD format
- * @param {boolean} isEndDate - If true, sets to end of day (23:59:59.999)
- * @returns {Date} Parsed date object
- */
-function parseDate(dateStr, isEndDate = false) {
-  if (!dateStr) return null;
-  
-  const date = new Date(dateStr);
-  if (isNaN(date.getTime())) {
-    throw new Error(`Invalid date format: ${dateStr}. Use YYYY-MM-DD format.`);
-  }
-  
-  if (isEndDate) {
-    date.setHours(23, 59, 59, 999);
-  } else {
-    date.setHours(0, 0, 0, 0);
-  }
-  
-  return date;
-}
-
-/**
- * Build date range filter based on timeframe parameters
- * Follows priority: custom range > specific day > month > year > today
- * @param {Object} query - Request query parameters
- * @returns {Object} MongoDB date filter { createdAt: { $gte, $lte } }
- */
-function buildTimeframeFilter(query) {
-  const { from, to, date, year, month } = query;
-  
-  // Priority 1: Custom date range (from and to)
-  if (from || to) {
-    const startDate = from ? parseDate(from, false) : new Date(0); // Beginning of time
-    const endDate = to ? parseDate(to, true) : new Date(); // Current date/time
-    
-    if (from && to && startDate > endDate) {
-      throw new Error("Start date (from) must be before or equal to end date (to)");
-    }
-    
-    return {
-      createdAt: {
-        $gte: startDate,
-        $lte: endDate
-      }
-    };
-  }
-  
-  // Priority 2: Specific day
-  if (date) {
-    const dayDate = parseDate(date, false);
-    const startDate = new Date(dayDate);
-    const endDate = new Date(dayDate);
-    endDate.setHours(23, 59, 59, 999);
-    
-    return {
-      createdAt: {
-        $gte: startDate,
-        $lte: endDate
-      }
-    };
-  }
-  
-  // Priority 3: Specific month
-  if (year && month) {
-    const yearNum = parseInt(year, 10);
-    const monthNum = parseInt(month, 10) - 1; // JS months are 0-indexed
-    
-    if (isNaN(yearNum) || yearNum < 2000 || yearNum > 2100) {
-      throw new Error(`Invalid year: ${year}. Must be between 2000-2100.`);
-    }
-    
-    if (isNaN(monthNum) || monthNum < 0 || monthNum > 11) {
-      throw new Error(`Invalid month: ${month}. Must be between 01-12.`);
-    }
-    
-    const startDate = new Date(yearNum, monthNum, 1);
-    const endDate = new Date(yearNum, monthNum + 1, 0); // Last day of month
-    endDate.setHours(23, 59, 59, 999);
-    
-    return {
-      createdAt: {
-        $gte: startDate,
-        $lte: endDate
-      }
-    };
-  }
-  
-  // Priority 4: Full year
-  if (year) {
-    const yearNum = parseInt(year, 10);
-    
-    if (isNaN(yearNum) || yearNum < 2000 || yearNum > 2100) {
-      throw new Error(`Invalid year: ${year}. Must be between 2000-2100.`);
-    }
-    
-    const startDate = new Date(yearNum, 0, 1); // Jan 1
-    const endDate = new Date(yearNum, 11, 31); // Dec 31
-    endDate.setHours(23, 59, 59, 999);
-    
-    return {
-      createdAt: {
-        $gte: startDate,
-        $lte: endDate
-      }
-    };
-  }
-  
-  // Priority 5: Default to today
-  const today = new Date();
-  const startDate = new Date(today);
-  startDate.setHours(0, 0, 0, 0);
-  const endDate = new Date(today);
-  endDate.setHours(23, 59, 59, 999);
-  
-  return {
-    createdAt: {
-      $gte: startDate,
-      $lte: endDate
-    }
-  };
-}
-
-/**
- * Get human-readable timeframe description
- */
-function getTimeframeDescription(query) {
-  const { from, to, date, year, month } = query;
-  
-  if (from || to) {
-    return `Custom range: ${from || 'Beginning'} to ${to || 'Now'}`;
-  }
-  if (date) {
-    return `Day: ${date}`;
-  }
-  if (year && month) {
-    return `Month: ${year}-${String(month).padStart(2, '0')}`;
-  }
-  if (year) {
-    return `Year: ${year}`;
-  }
-  return 'Today (default)';
-}
 
 // ✅ EMAIL FUNCTIONS
 async function sendExpenseNotification(expense) {
@@ -392,7 +271,7 @@ function isAdminUser(user) {
 
 /** 
  * GET /api/expenses
- * Timeframe-based pagination (no numeric pagination)
+ * Timeframe filters with bounded page-based pagination
  * Priority: custom range > specific day > month > year > today (default)
  */
 router.get("/", authMiddleware, async (req, res) => {
@@ -441,62 +320,62 @@ router.get("/", authMiddleware, async (req, res) => {
     
     // 4. Apply recordedBy filter if provided
     if (recordedBy) {
-      filter.recordedBy = { $regex: recordedBy, $options: "i" };
+      const escapedRecordedBy = String(recordedBy).replace(/[|\\{}()[\]^$+*?.-]/g, "\\$&");
+      filter.recordedBy = { $regex: escapedRecordedBy, $options: "i" };
     }
     
     // 5. Apply search filter if provided
     if (search) {
+      const escapedSearch = String(search).replace(/[|\\{}()[\]^$+*?.-]/g, "\\$&");
       filter.$or = [
-        { reason: { $regex: search, $options: "i" } },
-        { recipientName: { $regex: search, $options: "i" } },
-        { expenseId: { $regex: search, $options: "i" } },
-        { recipientPhone: { $regex: search, $options: "i" } }
+        { reason: { $regex: escapedSearch, $options: "i" } },
+        { recipientName: { $regex: escapedSearch, $options: "i" } },
+        { expenseId: { $regex: escapedSearch, $options: "i" } },
+        { recipientPhone: { $regex: escapedSearch, $options: "i" } }
       ];
     }
 
     // 6. Apply region filter if provided
     if (region) {
+      if (!["Bbbb", "Cnnn"].includes(region)) return res.status(400).json({ error: "Invalid region code" });
       filter.regionCode = region;
     }
 
-    // Execute query - get ALL records within timeframe (no skip/limit)
-    const expenses = await Expense.find(filter)
-      .select('-__v') // Exclude version key
-      .sort({ createdAt: -1 }) // Newest first
-      .lean();
-
-    // Get count for metadata
-    const total = expenses.length;
+    const { page, limit, skip } = reportingDate.parsePagination(req.query);
+    const [facet = {}] = await Expense.aggregate([
+      { $match: filter },
+      { $facet: {
+        data: [{ $sort: { createdAt: -1, _id: -1 } }, { $skip: skip }, { $limit: limit }, { $project: { __v: 0 } }],
+        metadata: [{ $count: "totalRecords" }],
+        totals: [{ $group: {
+          _id: null,
+          totalAmount: { $sum: "$amount" },
+          pendingCount: { $sum: { $cond: [{ $eq: ["$status", "pending"] }, 1, 0] } },
+          pendingAmount: { $sum: { $cond: [{ $eq: ["$status", "pending"] }, "$amount", 0] } },
+          validatedCount: { $sum: { $cond: [{ $eq: ["$status", "validated"] }, 1, 0] } },
+          validatedAmount: { $sum: { $cond: [{ $eq: ["$status", "validated"] }, "$amount", 0] } },
+          rejectedCount: { $sum: { $cond: [{ $eq: ["$status", "rejected"] }, 1, 0] } },
+          rejectedAmount: { $sum: { $cond: [{ $eq: ["$status", "rejected"] }, "$amount", 0] } },
+        } }],
+      } },
+    ]).allowDiskUse(true);
+    const expenses = facet.data || [];
+    const total = facet.metadata?.[0]?.totalRecords || 0;
 
     // Generate timeframe metadata
     const timeframeDescription = getTimeframeDescription(req.query);
     const timeframeFilter = buildTimeframeFilter(req.query);
 
-    // Calculate totals for quick insights
-    const totals = expenses.reduce((acc, expense) => {
-      acc.totalAmount += expense.amount;
-      
-      if (expense.status === "pending") {
-        acc.pendingCount += 1;
-        acc.pendingAmount += expense.amount;
-      } else if (expense.status === "validated") {
-        acc.validatedCount += 1;
-        acc.validatedAmount += expense.amount;
-      } else if (expense.status === "rejected") {
-        acc.rejectedCount += 1;
-        acc.rejectedAmount += expense.amount;
-      }
-      
-      return acc;
-    }, {
+    const totals = {
       totalAmount: 0,
       pendingCount: 0,
       pendingAmount: 0,
       validatedCount: 0,
       validatedAmount: 0,
       rejectedCount: 0,
-      rejectedAmount: 0
-    });
+      rejectedAmount: 0,
+      ...(facet.totals?.[0] || {}),
+    };
 
     // Prepare response with timeframe metadata
     const response = {
@@ -530,6 +409,7 @@ router.get("/", authMiddleware, async (req, res) => {
           amount: totals.rejectedAmount
         }
       },
+      pagination: { totalRecords: total, totalPages: Math.ceil(total / limit), currentPage: page, limit },
       filtersApplied: {
         status: status || 'default (all statuses)',
         paymentMethod: paymentMethod || 'none',
@@ -969,124 +849,35 @@ router.delete("/:id", authMiddleware, async (req, res) => {
 /** ---------- GET EXPENSE STATISTICS WITH TIMEFRAME FILTERING ---------- **/
 router.get("/stats/summary", authMiddleware, async (req, res) => {
   try {
-    // Build timeframe filter
-    let timeframeFilter;
-    try {
-      timeframeFilter = buildTimeframeFilter(req.query);
-    } catch (timeframeError) {
-      return res.status(400).json({ 
-        error: timeframeError.message,
-        suggestion: "Use valid date formats: YYYY-MM-DD"
-      });
-    }
-
-    const stats = await Expense.aggregate([
+    const timeframeFilter = buildTimeframeFilter(req.query);
+    const [facet = {}] = await Expense.aggregate([
       { $match: timeframeFilter },
-      {
-        $group: {
-          _id: "$status",
-          count: { $sum: 1 },
-          totalAmount: { $sum: "$amount" }
-        }
-      }
+      { $facet: {
+        statusBreakdown: [{ $group: { _id: "$status", count: { $sum: 1 }, totalAmount: { $sum: "$amount" } } }],
+        totals: [{ $group: { _id: null, totalExpenses: { $sum: 1 }, totalAmount: { $sum: "$amount" }, avgAmount: { $avg: "$amount" }, maxAmount: { $max: "$amount" }, minAmount: { $min: "$amount" } } }],
+        paymentMethods: [{ $group: { _id: "$paymentMethod", count: { $sum: 1 }, totalAmount: { $sum: "$amount" }, avgAmount: { $avg: "$amount" } } }, { $sort: { totalAmount: -1, _id: 1 } }],
+        dailyBreakdown: [{ $group: { _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt", timezone: "Africa/Lubumbashi" } }, count: { $sum: 1 }, totalAmount: { $sum: "$amount" } } }, { $sort: { _id: 1 } }, { $limit: 30 }],
+        topExpenses: [{ $sort: { amount: -1, _id: 1 } }, { $limit: 10 }, { $project: { expenseId: 1, reason: 1, amount: 1, status: 1, recipientName: 1, createdAt: 1 } }],
+        frequentRecipients: [{ $group: { _id: "$recipientName", count: { $sum: 1 }, totalAmount: { $sum: "$amount" }, avgAmount: { $avg: "$amount" } } }, { $sort: { count: -1, _id: 1 } }, { $limit: 10 }],
+      } },
     ]);
-
-    const totalStats = await Expense.aggregate([
-      { $match: timeframeFilter },
-      {
-        $group: {
-          _id: null,
-          totalExpenses: { $sum: 1 },
-          totalAmount: { $sum: "$amount" },
-          avgAmount: { $avg: "$amount" },
-          maxAmount: { $max: "$amount" },
-          minAmount: { $min: "$amount" }
-        }
-      }
-    ]);
-
-    const paymentMethodStats = await Expense.aggregate([
-      { $match: timeframeFilter },
-      {
-        $group: {
-          _id: "$paymentMethod",
-          count: { $sum: 1 },
-          totalAmount: { $sum: "$amount" },
-          avgAmount: { $avg: "$amount" }
-        }
-      }
-    ]);
-
-    // Get daily breakdown for the timeframe
-    const dailyBreakdown = await Expense.aggregate([
-      { $match: timeframeFilter },
-      {
-        $group: {
-          _id: {
-            year: { $year: "$createdAt" },
-            month: { $month: "$createdAt" },
-            day: { $dayOfMonth: "$createdAt" }
-          },
-          date: { $first: "$createdAt" },
-          count: { $sum: 1 },
-          totalAmount: { $sum: "$amount" }
-        }
-      },
-      { $sort: { "_id.year": 1, "_id.month": 1, "_id.day": 1 } },
-      { $limit: 30 } // Limit to last 30 days
-    ]);
-
-    // Get top expenses
-    const topExpenses = await Expense.find(timeframeFilter)
-      .sort({ amount: -1 })
-      .limit(10)
-      .select('expenseId reason amount status recipientName createdAt')
-      .lean();
-
-    // Get most frequent recipients
-    const frequentRecipients = await Expense.aggregate([
-      { $match: timeframeFilter },
-      {
-        $group: {
-          _id: "$recipientName",
-          count: { $sum: 1 },
-          totalAmount: { $sum: "$amount" },
-          avgAmount: { $avg: "$amount" }
-        }
-      },
-      { $sort: { count: -1 } },
-      { $limit: 10 }
-    ]);
-
-    // Format the daily breakdown
-    const formattedDailyBreakdown = dailyBreakdown.map(day => ({
-      date: day.date.toISOString().split('T')[0],
-      count: day.count,
-      totalAmount: day.totalAmount
-    }));
-
     res.json({
       timeframe: {
         description: getTimeframeDescription(req.query),
         start: timeframeFilter.createdAt.$gte,
-        end: timeframeFilter.createdAt.$lte
+        end: timeframeFilter.createdAt.$lte,
       },
-      statusBreakdown: stats,
-      totals: totalStats[0] || { 
-        totalExpenses: 0, 
-        totalAmount: 0, 
-        avgAmount: 0,
-        maxAmount: 0,
-        minAmount: 0
-      },
-      paymentMethods: paymentMethodStats,
-      dailyBreakdown: formattedDailyBreakdown,
-      topExpenses: topExpenses,
-      frequentRecipients: frequentRecipients
+      statusBreakdown: facet.statusBreakdown || [],
+      totals: facet.totals?.[0] || { totalExpenses: 0, totalAmount: 0, avgAmount: 0, maxAmount: 0, minAmount: 0 },
+      paymentMethods: facet.paymentMethods || [],
+      dailyBreakdown: (facet.dailyBreakdown || []).map((day) => ({ date: day._id, count: day.count, totalAmount: day.totalAmount })),
+      topExpenses: facet.topExpenses || [],
+      frequentRecipients: facet.frequentRecipients || [],
     });
   } catch (error) {
     console.error("Error fetching expense statistics:", error);
-    res.status(500).json({ error: "Failed to fetch expense statistics" });
+    res.status(/Invalid date|Invalid year|Invalid month|Start date/.test(error.message) ? 400 : 500)
+      .json({ error: /Invalid/.test(error.message) ? error.message : "Failed to fetch expense statistics" });
   }
 });
 
@@ -1147,27 +938,7 @@ router.get("/recipient/:phone", authMiddleware, async (req, res) => {
     // Add recipient filter
     timeframeFilter.recipientPhone = { $regex: phone, $options: "i" };
 
-    const expenses = await Expense.find(timeframeFilter)
-      .sort({ createdAt: -1 })
-      .lean();
-
-    // Calculate totals
-    const totals = expenses.reduce((acc, expense) => {
-      acc.totalAmount += expense.amount;
-      acc.count += 1;
-      
-      if (expense.status === "validated") {
-        acc.validatedAmount += expense.amount;
-        acc.validatedCount += 1;
-      }
-      
-      return acc;
-    }, {
-      totalAmount: 0,
-      count: 0,
-      validatedAmount: 0,
-      validatedCount: 0
-    });
+    const { expenses, summary: totals, pagination } = await getPagedExpensesWithSummary(timeframeFilter, req.query);
 
     res.json({
       success: true,
@@ -1179,7 +950,8 @@ router.get("/recipient/:phone", authMiddleware, async (req, res) => {
         validatedExpenses: totals.validatedCount,
         validatedAmount: totals.validatedAmount
       },
-      expenses: expenses
+      expenses,
+      pagination
     });
   } catch (error) {
     console.error("Error fetching expenses by recipient:", error);
@@ -1210,22 +982,15 @@ router.get("/status/:status", authMiddleware, async (req, res) => {
     // Add status filter
     timeframeFilter.status = status;
 
-    const expenses = await Expense.find(timeframeFilter)
-      .sort({ createdAt: -1 })
-      .lean();
-
-    const totalAmount = expenses.reduce((sum, expense) => sum + expense.amount, 0);
+    const { expenses, summary, pagination } = await getPagedExpensesWithSummary(timeframeFilter, req.query);
 
     res.json({
       success: true,
       status: status,
       timeframe: getTimeframeDescription(req.query),
-      summary: {
-        count: expenses.length,
-        totalAmount: totalAmount,
-        averageAmount: expenses.length > 0 ? totalAmount / expenses.length : 0
-      },
-      expenses: expenses
+      summary,
+      pagination,
+      expenses
     });
   } catch (error) {
     console.error("Error fetching expenses by status:", error);
