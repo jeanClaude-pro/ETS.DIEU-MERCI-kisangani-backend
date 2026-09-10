@@ -5,6 +5,9 @@ const Sale = require("../models/Sale"); // Make sure to import Sale model
 const { ensureWalkInCustomer } = require("../utils/walkInCustomer");
 const mongoose = require("mongoose");
 const { parsePagination } = require("../utils/reportingDate");
+const authMiddleware = require("../middleware/auth");
+
+router.use(authMiddleware);
 
 // GET /api/customers/walkin - Get the permanent system Walk-in Customer
 // (created lazily here as a fallback in case the startup bootstrap hasn't run)
@@ -68,6 +71,66 @@ router.get("/", async (req, res) => {
   } catch (error) {
     console.error("Error fetching customers:", error);
     res.status(500).json({ error: "Failed to fetch customers" });
+  }
+});
+
+// POST /api/customers - Create a new customer
+router.post("/", async (req, res) => {
+  try {
+    const { name, phone, email } = req.body;
+
+    if (!name || !String(name).trim() || !phone || !String(phone).trim()) {
+      return res.status(400).json({ error: "Name and phone are required" });
+    }
+
+    const customer = await Customer.create({
+      name: String(name).trim(),
+      phone: String(phone).trim(),
+      email: email ? String(email).trim() : "",
+    });
+
+    res.status(201).json(customer);
+  } catch (error) {
+    console.error("Error creating customer:", error);
+
+    if (error.code === 11000) {
+      return res.status(409).json({ error: "A customer with this phone number already exists" });
+    }
+
+    if (error.name === "ValidationError") {
+      const errors = Object.values(error.errors).map(e => e.message);
+      return res.status(400).json({ error: errors.join(", ") });
+    }
+
+    res.status(500).json({ error: "Failed to create customer" });
+  }
+});
+
+// DELETE /api/customers/:id - Delete a customer (admin only)
+router.delete("/:id", async (req, res) => {
+  try {
+    if (req.user.role !== "admin") {
+      return res.status(403).json({ error: "Only admins can delete customers" });
+    }
+
+    const customer = await Customer.findById(req.params.id);
+    if (!customer) {
+      return res.status(404).json({ error: "Customer not found" });
+    }
+    if (customer.isWalkIn) {
+      return res.status(400).json({ error: "The Walk-in Customer record cannot be deleted" });
+    }
+
+    await Customer.deleteOne({ _id: customer._id });
+    res.json({ message: "Customer deleted", _id: customer._id });
+  } catch (error) {
+    console.error("Error deleting customer:", error);
+
+    if (error.name === "CastError") {
+      return res.status(400).json({ error: "Invalid customer ID" });
+    }
+
+    res.status(500).json({ error: "Failed to delete customer" });
   }
 });
 

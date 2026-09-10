@@ -87,7 +87,7 @@ productSchema.pre("validate", function (next) {
 productSchema.index({ name: "text", description: "text", brand: "text" });
 productSchema.index({ category: 1 });
 productSchema.index({ status: 1 });
-productSchema.index({ region: 1 });
+productSchema.index({ regionCode: 1 });
 
 // Reuse if it already exists (prevents OverwriteModelError)
 const Product =

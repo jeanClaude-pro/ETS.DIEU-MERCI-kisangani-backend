@@ -36,10 +36,13 @@ function regionWeightExpression(code) {
 // Mirrors calculateRegionTotal(): totals are converted to cents, truncated by
 // regional weight, then remainder cents go to the largest fractional shares.
 // Ties keep the stable Bbbb, Cnnn, Unknown order used by the JS implementation.
+// $let variable names must start with a lowercase letter, so region codes
+// (e.g. "Bbbb") can't be used directly as var names — hence the "w" prefix.
 function regionRevenueExpression(regionCode) {
   const order = ["Bbbb", "Cnnn", "Unknown"];
-  const weightVars = Object.fromEntries(order.map((code) => [code, regionWeightExpression(code)]));
-  const exact = (code) => ({ $divide: [{ $multiply: ["$$totalCents", `$$${code}`] }, "$$weight"] });
+  const varName = (code) => `w${code}`;
+  const weightVars = Object.fromEntries(order.map((code) => [varName(code), regionWeightExpression(code)]));
+  const exact = (code) => ({ $divide: [{ $multiply: ["$$totalCents", `$$${varName(code)}`] }, "$$weight"] });
   const base = (code) => ({ $trunc: exact(code) });
   const fraction = (code) => ({ $subtract: [exact(code), base(code)] });
   const rank = (code) => ({ $add: order.filter((candidate) => candidate !== code).map((candidate) => ({
@@ -51,9 +54,9 @@ function regionRevenueExpression(regionCode) {
   return { $let: { vars: {
     ...weightVars,
     totalCents: { $round: [{ $multiply: [{ $ifNull: ["$total", 0] }, 100] }, 0] },
-  }, in: { $let: { vars: { weight: { $add: order.map((code) => `$$${code}`) } }, in: {
+  }, in: { $let: { vars: { weight: { $add: order.map((code) => `$$${varName(code)}`) } }, in: {
     $cond: [
-      { $or: [{ $lte: ["$$weight", 0] }, { $lte: [`$$${regionCode}`, 0] }] },
+      { $or: [{ $lte: ["$$weight", 0] }, { $lte: [`$$${varName(regionCode)}`, 0] }] },
       0,
       { $let: { vars: {
         remaining: { $subtract: ["$$totalCents", { $add: order.map(base) }] },

@@ -54,6 +54,31 @@ function evaluate(expression, document, variables = {}) {
   throw new Error(`Unsupported test operator ${operator}`);
 }
 
+// MongoDB requires $let variable names to start with a lowercase ASCII letter
+// or "_" (region codes like "Bbbb"/"Cnnn" fail this and are rejected at query
+// time with "starts with an invalid character for a user variable name" —
+// a bug the pure-JS evaluate() above can't catch since it doesn't enforce
+// Mongo's variable-naming rules). Walk every $let in the pipeline and check.
+function assertValidLetVariableNames(expression) {
+  if (expression === null || typeof expression !== "object") return;
+  if (Array.isArray(expression)) {
+    for (const item of expression) assertValidLetVariableNames(item);
+    return;
+  }
+  if (expression.$let) {
+    for (const name of Object.keys(expression.$let.vars || {})) {
+      assert.match(name, /^[a-z_][A-Za-z0-9_]*$/, `"${name}" is not a valid $let variable name`);
+    }
+  }
+  for (const value of Object.values(expression)) assertValidLetVariableNames(value);
+}
+
+test("regional revenue expression uses Mongo-legal $let variable names for every region code", () => {
+  for (const region of ["Bbbb", "Cnnn", "Unknown"]) {
+    assertValidLetVariableNames(regionRevenueExpression(region));
+  }
+});
+
 test("regional revenue expression allocates receipt totals instead of duplicating charges", () => {
   const expression = JSON.stringify(regionRevenueExpression("Bbbb"));
   assert.match(expression, /totalCents/);
