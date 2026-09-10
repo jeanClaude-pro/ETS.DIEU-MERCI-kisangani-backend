@@ -1,6 +1,7 @@
 const express = require("express");
 const escpos = require("escpos");
 const authMiddleware = require("../middleware/auth");
+const Sale = require("../models/Sale");
 
 escpos.USB = require("escpos-usb");
 const router = express.Router();
@@ -15,7 +16,10 @@ const CP850_CHARACTER_TABLE = 2;
 const BUSINESS = Object.freeze({
   name: "Boutique C'EST DIEU QUI PARTAGE",
   address: "Av du 1er Janvier N°13, C. Makiso, Kisangani",
+  phone: "+243 839 336 794",
   registration: "RCCM/KIS : 22-A-267",
+  thankYou: "Merci pour votre confiance.",
+  salesNotice: "Marchandises vendues non reprises, non échangées.",
 });
 
 const numberValue = (value) => {
@@ -34,6 +38,7 @@ function normalizeReceiptData(receiptData = {}, requestedType = "sale") {
         const unitPrice = numberValue(item.unitPrice ?? item.price);
         return {
           name: textValue(item.name) || "Article",
+          unit: textValue(item.unit),
           quantity,
           unitPrice,
           lineTotal: numberValue(item.lineTotal ?? item.total ?? item.subtotal) || quantity * unitPrice,
@@ -44,14 +49,23 @@ function normalizeReceiptData(receiptData = {}, requestedType = "sale") {
   const type = requestedType === "reservation" || receiptData.type === "reservation"
     ? "reservation"
     : "sale";
+  const snapshotRate = numberValue(receiptData.exchangeRateSnapshot?.rate);
+  const rawDate = receiptData.createdAt ?? receiptData.date;
+  const parsedDate = rawDate ? new Date(rawDate) : null;
+  const formattedDate = parsedDate && !Number.isNaN(parsedDate.getTime())
+    ? parsedDate.toLocaleString("fr-FR", {
+        day: "2-digit", month: "2-digit", year: "numeric",
+        hour: "2-digit", minute: "2-digit", timeZone: "Africa/Lubumbashi",
+      })
+    : textValue(rawDate) || new Date().toLocaleString("fr-FR", { timeZone: "Africa/Lubumbashi" });
 
   return {
     type,
     status: textValue(receiptData.status) || (type === "reservation" ? "pending" : "completed"),
-    reference: textValue(receiptData.reference ?? receiptData.receiptNumber ?? receiptData.stubNumber) || "N/A",
-    date: textValue(receiptData.date) || new Date().toLocaleString("fr-FR", { timeZone: "Africa/Lubumbashi" }),
-    customerName: textValue(receiptData.customerName) || "Walk-in Customer",
-    customerPhone: textValue(receiptData.customerPhone),
+    reference: textValue(receiptData.saleId ?? receiptData.reference ?? receiptData.receiptNumber ?? receiptData.stubNumber ?? receiptData._id) || "N/A",
+    date: formattedDate,
+    customerName: textValue(receiptData.customer?.name ?? receiptData.customerName) || "Walk-in Customer",
+    customerPhone: textValue(receiptData.customer?.phone ?? receiptData.customerPhone),
     items,
     subtotal: numberValue(receiptData.subtotal) || items.reduce((sum, item) => sum + item.lineTotal, 0),
     discount: numberValue(receiptData.discount),
@@ -61,7 +75,7 @@ function normalizeReceiptData(receiptData = {}, requestedType = "sale") {
     total: numberValue(receiptData.total),
     paymentMethod: textValue(receiptData.paymentMethod) || "cash",
     salesPerson: textValue(receiptData.salesPerson) || "Agent",
-    exchangeRate: numberValue(receiptData.exchangeRate),
+    exchangeRate: snapshotRate || numberValue(receiptData.exchangeRate),
     reservationDate: textValue(receiptData.reservationDate),
     reservationTime: textValue(receiptData.reservationTime),
     notes: textValue(receiptData.notes),
@@ -159,7 +173,7 @@ function printBusinessHeader(printer) {
     .text(BUSINESS.name)
     .style("normal");
   for (const addressLine of wrapText(BUSINESS.address)) printer.text(addressLine);
-  printer.text(BUSINESS.registration).text(line);
+  printer.text(`Tél. : ${BUSINESS.phone}`).text(BUSINESS.registration).text(line);
 }
 
 function printMainReceipt(printer, receipt) {
@@ -180,14 +194,25 @@ function printMainReceipt(printer, receipt) {
     }
   }
 
-  printer.text(line).text(`Client : ${receipt.customerName}`);
-  if (receipt.customerPhone) printer.text(`Tél. : ${receipt.customerPhone}`);
-  printer.text(line).style("b").text("ARTICLES").style("normal");
+  printer.text(line);
+  for (const customerLine of wrapText(`Client : ${receipt.customerName}`)) printer.text(customerLine);
+  if (receipt.customerPhone) {
+    for (const phoneLine of wrapText(`Tél. : ${receipt.customerPhone}`)) printer.text(phoneLine);
+  }
+  printer.text(line).align("ct").style("b").text("ARTICLES ACHETÉS").style("normal").align("lt");
 
   for (const item of receipt.items) {
     const label = `${item.name}${item.regionCode ? ` (${item.regionCode})` : ""}`;
     for (const nameLine of wrapText(label)) printer.text(nameLine);
-    printer.text(columns(`${item.quantity} x ${money(item.unitPrice)}`, money(item.lineTotal)));
+    const quantityLabel = `${item.quantity}${item.unit ? ` ${item.unit}` : ""} x ${money(item.unitPrice)}`;
+    printer.text(columns(quantityLabel, money(item.lineTotal)));
+    if (receipt.exchangeRate > 0) {
+      printer
+        .text(columns("PU FC", `${Math.round(item.unitPrice * receipt.exchangeRate)} FC`))
+        .style("b")
+        .text(columns("Total article FC", `${Math.round(item.lineTotal * receipt.exchangeRate)} FC`))
+        .style("normal");
+    }
   }
 
   printer.text(line).text(columns("Sous-total", money(receipt.subtotal)));
@@ -201,17 +226,17 @@ function printMainReceipt(printer, receipt) {
       .text(columns("TOTAL FC", `${Math.round(receipt.total * receipt.exchangeRate)} FC`))
       .text(`Taux enregistré : 1 USD = ${Math.round(receipt.exchangeRate)} FC`);
   }
-  printer
-    .text(`Paiement : ${receipt.paymentMethod.toUpperCase()}`)
-    .text(`Agent : ${receipt.salesPerson}`);
+  printer.text(`Paiement : ${receipt.paymentMethod.toUpperCase()}`);
+  for (const agentLine of wrapText(`Agent de vente : ${receipt.salesPerson}`)) printer.text(agentLine);
   if (isReservation && receipt.notes) {
     for (const noteLine of wrapText(`Notes : ${receipt.notes}`)) printer.text(noteLine);
   }
   printer
     .align("ct")
-    .text("Merci pour votre confiance.")
-    .text("Marchandises vendues non reprises,")
-    .text("non échangées.");
+    .style("b")
+    .text(BUSINESS.thankYou)
+    .style("normal");
+  for (const noticeLine of wrapText(BUSINESS.salesNotice)) printer.text(noticeLine);
   finishDocument(printer);
   return printer;
 }
@@ -225,26 +250,38 @@ function printStub(printer, receipt) {
     .text(BUSINESS.name)
     .text(isReservation ? "SOUCHE DE RÉSERVATION" : "SOUCHE DE VENTE")
     .style("normal")
-    .align("lt")
-    .text(`Référence : ${receipt.reference}`)
-    .text(`Date : ${receipt.date}`)
-    .text(`Client : ${receipt.customerName}`)
-    .text(`Statut : ${receipt.status.toUpperCase()}`);
+    .align("lt");
+  for (const value of [
+    `Référence : ${receipt.reference}`,
+    `Date : ${receipt.date}`,
+    `Client : ${receipt.customerName}`,
+    `Statut : ${receipt.status.toUpperCase()}`,
+  ]) {
+    for (const metadataLine of wrapText(value)) printer.text(metadataLine);
+  }
   if (isReservation && (receipt.reservationDate || receipt.reservationTime)) {
     printer.text(`Retrait : ${[receipt.reservationDate, receipt.reservationTime].filter(Boolean).join(" à ")}`);
   }
-  printer.text(line).style("b").text("ARTICLES / QUANTITÉS").style("normal");
+  printer.text(line).align("ct").style("b").text("ARTICLES VENDUS").style("normal").align("lt");
   for (const item of receipt.items) {
     for (const nameLine of wrapText(item.name)) printer.text(nameLine);
-    printer.text(columns("Quantité", String(item.quantity)));
+    printer.text(columns(`${item.quantity}${item.unit ? ` ${item.unit}` : ""} x ${money(item.unitPrice)}`, money(item.lineTotal)));
+    if (receipt.exchangeRate > 0) {
+      printer.text(columns("Total FC", `${Math.round(item.lineTotal * receipt.exchangeRate)} FC`));
+    }
   }
   printer
     .text(line)
     .text(`Paiement : ${receipt.paymentMethod.toUpperCase()}`)
     .style("b")
     .text(columns("TOTAL", money(receipt.total)))
+    .style("normal");
+  for (const agentLine of wrapText(`Agent de vente : ${receipt.salesPerson}`)) printer.text(agentLine);
+  printer.align("ct")
+    .style("b")
+    .text("SOUCHE DE CAISSE")
     .style("normal")
-    .text(`Agent : ${receipt.salesPerson}`);
+    .text("À conserver");
   finishDocument(printer);
   return printer;
 }
@@ -267,17 +304,43 @@ async function sendReceiptThenStub(printer, receipt, flush = flushPrinter) {
 }
 
 async function handleCombinedPrint(req, res) {
-  const printer = getPrinter();
-  if (!printer) {
-    return res.status(503).json({ error: "No printer found", printedDocuments: [] });
-  }
-
   let deviceOpened = false;
   let printedDocuments = [];
+  let printer = null;
   try {
-    const receipt = normalizeReceiptData(req.body?.receiptData, req.body?.type);
+    const savedSaleId = textValue(req.body?.savedSaleId);
+    let source = req.body?.receiptData;
+    if (savedSaleId) {
+      const savedSale = /^[a-f\d]{24}$/i.test(savedSaleId)
+        ? await Sale.findById(savedSaleId).lean()
+        : await Sale.findOne({ saleId: savedSaleId }).lean();
+      if (!savedSale) {
+        return res.status(404).json({
+          success: false,
+          code: "SAVED_SALE_NOT_FOUND",
+          error: "Saved sale not found",
+          printedDocuments,
+        });
+      }
+      source = savedSale;
+    }
+    const receipt = normalizeReceiptData(source, req.body?.type);
     if (!isValidReceiptData(receipt)) {
-      return res.status(400).json({ error: "Valid saved sale data is required", printedDocuments });
+      return res.status(400).json({
+        success: false,
+        code: "INVALID_RECEIPT_DATA",
+        error: "Valid saved sale data is required",
+        printedDocuments,
+      });
+    }
+    printer = getPrinter();
+    if (!printer) {
+      return res.status(503).json({
+        success: false,
+        code: "DIRECT_PRINTER_UNAVAILABLE",
+        error: "No printer found",
+        printedDocuments,
+      });
     }
     await openDevice(printer.device);
     deviceOpened = true;
@@ -286,6 +349,7 @@ async function handleCombinedPrint(req, res) {
     deviceOpened = false;
     return res.json({
       success: true,
+      code: "DIRECT_PRINT_COMPLETE",
       message: "Receipt and stub printed successfully",
       documents: printedDocuments,
       printedDocuments,
@@ -293,7 +357,7 @@ async function handleCombinedPrint(req, res) {
   } catch (error) {
     printedDocuments = error.printedDocuments || printedDocuments;
     console.error("Combined receipt printing failed:", error);
-    if (deviceOpened) {
+    if (deviceOpened && printer) {
       try {
         await closeDevice(printer);
       } catch (closeError) {
@@ -301,6 +365,10 @@ async function handleCombinedPrint(req, res) {
       }
     }
     return res.status(500).json({
+      success: false,
+      code: printedDocuments.includes("receipt")
+        ? "DIRECT_STUB_PRINT_FAILED"
+        : "DIRECT_RECEIPT_PRINT_FAILED",
       error: "Receipt and stub printing failed",
       printedDocuments,
     });

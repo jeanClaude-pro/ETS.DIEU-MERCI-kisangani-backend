@@ -105,8 +105,10 @@ test("ESC/POS sends and flushes the full receipt before building the stub", asyn
   assert.ok(firstFlush < stubTitle);
   assert.ok(stubTitle < secondFlush);
   assert.ok(printer.textLines.includes("Statut : COMPLETED"));
-  assert.ok(printer.textLines.includes("ARTICLES / QUANTITÉS"));
-  assert.ok(printer.textLines.some((value) => value.startsWith("Quantité") && value.endsWith("2")));
+  assert.ok(printer.textLines.includes("ARTICLES ACHETÉS"));
+  assert.ok(printer.textLines.includes("ARTICLES VENDUS"));
+  assert.ok(printer.textLines.includes("SOUCHE DE CAISSE"));
+  assert.ok(printer.textLines.some((value) => value.startsWith("2 x 10.00 USD")));
 });
 
 test("empty and malformed payloads are rejected before a printer job", () => {
@@ -118,6 +120,27 @@ test("empty and malformed payloads are rejected before a printer job", () => {
     items: [{ name: "Article", quantity: 0, unitPrice: 10, lineTotal: 0 }],
   })), false);
   assert.equal(isValidReceiptData(normalizeReceiptData(savedReceipt)), true);
+});
+
+test("committed Sale documents normalize their nested snapshots", () => {
+  const { normalizeReceiptData } = printRouter._testing;
+  const receipt = normalizeReceiptData({
+    _id: "database-id",
+    saleId: "SALE-SAVED",
+    createdAt: "2026-09-09T08:30:00.000Z",
+    customer: { name: "Amina", phone: "+243000000" },
+    items: [{ name: "Robe", unit: "pcs", quantity: 2, price: 10, total: 20 }],
+    subtotal: 20,
+    total: 20,
+    paymentMethod: "cash",
+    salesPerson: "Jean",
+    exchangeRateSnapshot: { rate: 2800 },
+  });
+
+  assert.equal(receipt.reference, "SALE-SAVED");
+  assert.equal(receipt.customerName, "Amina");
+  assert.equal(receipt.items[0].unit, "pcs");
+  assert.equal(receipt.exchangeRate, 2800);
 });
 
 test("a stub transfer failure reports that only the receipt was printed", async () => {

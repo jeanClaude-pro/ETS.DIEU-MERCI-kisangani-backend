@@ -97,6 +97,9 @@ function buildCanonicalSaleItem(product, item) {
   return {
     productId: product._id,
     name: canonicalProductName(product),
+    ...(String(product.unit || item?.unit || "").trim() && {
+      unit: String(product.unit || item?.unit).trim(),
+    }),
     quantity,
     price,
     subtotal,
@@ -120,6 +123,7 @@ function buildEditedSaleItem(product, oldItem, item) {
         _id: item.productId,
         name: oldItem.name || product?.name,
         originalName: oldItem.name || product?.originalName,
+        unit: oldItem.unit || product?.unit,
         region: oldItem.region,
         regionCode: oldItem.regionCode,
         unitCost: oldItem.unitCost ?? product?.unitCost ?? 0,

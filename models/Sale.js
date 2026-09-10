@@ -27,6 +27,11 @@ const saleItemSchema = new mongoose.Schema({
     required: false, // Made optional for expenses
     min: 0
   },
+  unit: {
+    type: String,
+    required: false,
+    trim: true
+  },
   subtotal: { type: Number, required: false, min: 0 },
   unitCost: { type: Number, required: false, min: 0 },
   cost: { type: Number, required: false, min: 0 },
