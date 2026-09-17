@@ -78,6 +78,7 @@ test("ESC/POS receipt is readable, wraps names, and uses minimal cut feed", () =
   assert.ok(printer.textLines.some((value) => value.includes("Remise")));
   assert.ok(printer.textLines.some((value) => value.includes("TOTAL FC")));
   assert.ok(printer.textLines.some((value) => value.includes("Bbbb")));
+  assert.equal(printer.textLines.some((value) => value.includes("Total article FC")), false);
   assert.ok(printer.textLines.every((value) => value.length <= PAPER_COLUMNS));
   assert.equal(printer.operations.some((value) => value.startsWith("feed:")), false);
 });
@@ -120,6 +121,14 @@ test("empty and malformed payloads are rejected before a printer job", () => {
     items: [{ name: "Article", quantity: 0, unitPrice: 10, lineTotal: 0 }],
   })), false);
   assert.equal(isValidReceiptData(normalizeReceiptData(savedReceipt)), true);
+});
+
+test("every authenticated role can reprint without receiving sale mutation rights", () => {
+  const { canReprintSale } = printRouter._testing;
+  for (const role of ["admin", "manager", "inventory_manager", "cashier_supervisor", "staff"]) {
+    assert.equal(canReprintSale({ _id: "user-id", role }), true);
+  }
+  assert.equal(canReprintSale(null), false);
 });
 
 test("committed Sale documents normalize their nested snapshots", () => {

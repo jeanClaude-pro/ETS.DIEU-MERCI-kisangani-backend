@@ -6,6 +6,7 @@ const Sale = require("../models/Sale");
 const Customer = require("../models/Customer");
 const Product = require("../models/Product");
 const authMiddleware = require("../middleware/auth");
+const requireModulePermission = require("../middleware/requireModulePermission");
 const { WALKIN_CUSTOMER_NAME, WALKIN_CUSTOMER_PHONE, resolveSaleCustomer } = require("../utils/walkInCustomer");
 const { VALID_REGION_CODES } = require("../utils/regions");
 const { buildCanonicalSaleItem, buildEditedSaleItem, calculateSaleFinancials, allocateSaleFinancialsToItems } = require("../utils/saleIntegrity");
@@ -114,7 +115,7 @@ async function recalculateCustomerStats(customerId, session = null) {
  * Timeframe filters with bounded page-based pagination
  * Priority: custom range > specific day > month > year > today (default)
  */
-router.get("/", authMiddleware, async (req, res) => {
+router.get("/", authMiddleware, requireModulePermission("sales"), async (req, res) => {
   try {
     const { customerPhone, customer, status, type, region, paymentMethod, search, edited } = req.query;
     const { page, limit, skip } = reportingDate.parsePagination(req.query);
@@ -207,7 +208,7 @@ router.get("/", authMiddleware, async (req, res) => {
 });
 
 /** ---------- DAILY STATS FIRST (before :id) ---------- **/
-router.get("/stats/daily", authMiddleware, async (req, res) => {
+router.get("/stats/daily", authMiddleware, requireModulePermission("sales"), async (req, res) => {
   try {
     const dateStr = req.query.date || getTodayKisangani();
     const dateFilter = reportingDate.buildTimeframeFilter({ date: dateStr });
@@ -242,7 +243,7 @@ router.get("/stats/daily", authMiddleware, async (req, res) => {
 });
 
 /** ---------- CREATE SALE OR EXPENSE ---------- **/
-router.post("/", authMiddleware, async (req, res) => {
+router.post("/", authMiddleware, requireModulePermission(["pos", "reservation"]), async (req, res) => {
   try {
     const {
       customer,
@@ -437,7 +438,7 @@ router.post("/", authMiddleware, async (req, res) => {
 // ==================== RELATED HISTORY ENDPOINTS ====================
 
 /** ---------- GET EXPENSES (TIME FRAME BASED) ---------- **/
-router.get("/expenses/all", authMiddleware, async (req, res) => {
+router.get("/expenses/all", authMiddleware, requireModulePermission("sortiehistory"), async (req, res) => {
   try {
     const { 
       status 
@@ -491,7 +492,7 @@ router.get("/expenses/all", authMiddleware, async (req, res) => {
 });
 
 /** ---------- GET RESERVATIONS (TIME FRAME BASED) ---------- **/
-router.get("/reservations/all", authMiddleware, async (req, res) => {
+router.get("/reservations/all", authMiddleware, requireModulePermission("reservations"), async (req, res) => {
   try {
     const { status, region, search } = req.query;
     const { page, limit, skip } = reportingDate.parsePagination(req.query);
@@ -553,7 +554,7 @@ router.get("/reservations/all", authMiddleware, async (req, res) => {
 // ==================== ALL OTHER ROUTES REMAIN EXACTLY THE SAME ====================
 
 /** ---------- GET BY ID (after other specific routes) ---------- **/
-router.get("/:id", authMiddleware, async (req, res) => {
+router.get("/:id", authMiddleware, requireModulePermission("sales"), async (req, res) => {
   try {
     const saleId = req.params.id;
     
@@ -602,7 +603,7 @@ router.get("/:id", authMiddleware, async (req, res) => {
 });
 
 /** ---------- EDIT SALE (Role-Based Restrictions) ---------- **/
-router.put("/:id", authMiddleware, async (req, res) => {
+router.put("/:id", authMiddleware, requireModulePermission("sales"), async (req, res) => {
   try {
     const { id } = req.params;
     const { 
@@ -857,7 +858,7 @@ router.put("/:id", authMiddleware, async (req, res) => {
 });
 
 /** ---------- MARK RESERVATION AS COMPLETED ---------- **/
-router.patch("/:id/complete", authMiddleware, async (req, res) => {
+router.patch("/:id/complete", authMiddleware, requireModulePermission("sales"), async (req, res) => {
   try {
     const { id } = req.params;
     const { completedBy } = req.body;
@@ -895,7 +896,7 @@ router.patch("/:id/complete", authMiddleware, async (req, res) => {
 });
 
 /** ---------- MARK RESERVATION AS PENDING ---------- **/
-router.patch("/:id/pending", authMiddleware, async (req, res) => {
+router.patch("/:id/pending", authMiddleware, requireModulePermission("sales"), async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -934,7 +935,7 @@ router.patch("/:id/pending", authMiddleware, async (req, res) => {
 });
 
 /** ---------- VOID/REFUND SALE ---------- **/
-router.patch("/:id/void", authMiddleware, async (req, res) => {
+router.patch("/:id/void", authMiddleware, requireModulePermission("sales"), async (req, res) => {
   const session = await mongoose.startSession();
   try {
     if (req.user.role !== "admin") {
@@ -997,7 +998,7 @@ router.patch("/:id/void", authMiddleware, async (req, res) => {
 });
 
 /** ---------- DELETE SALE ---------- **/
-router.delete("/:id", authMiddleware, async (req, res) => {
+router.delete("/:id", authMiddleware, requireModulePermission("sales"), async (req, res) => {
   const session = await mongoose.startSession();
   try {
     if (req.user.role !== "admin") {

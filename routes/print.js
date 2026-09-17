@@ -13,6 +13,12 @@ const MINIMUM_CUT_FEED = 1;
 const PRINTER_ENCODING = "CP850";
 const CP850_CHARACTER_TABLE = 2;
 
+// Reprinting is intentionally role-independent: authentication is the only
+// permission boundary. Sale mutation endpoints keep their existing guards.
+function canReprintSale(user) {
+  return Boolean(user && user._id);
+}
+
 const BUSINESS = Object.freeze({
   name: "Boutique C'EST DIEU QUI PARTAGE",
   address: "Av du 1er Janvier N°13, C. Makiso, Kisangani",
@@ -173,7 +179,7 @@ function printBusinessHeader(printer) {
     .text(BUSINESS.name)
     .style("normal");
   for (const addressLine of wrapText(BUSINESS.address)) printer.text(addressLine);
-  printer.text(`Tél. : ${BUSINESS.phone}`).text(BUSINESS.registration).text(line);
+  for (const contactLine of wrapText(`Tél. ${BUSINESS.phone} | ${BUSINESS.registration}`)) printer.text(contactLine);
 }
 
 function printMainReceipt(printer, receipt) {
@@ -194,11 +200,8 @@ function printMainReceipt(printer, receipt) {
     }
   }
 
-  printer.text(line);
-  for (const customerLine of wrapText(`Client : ${receipt.customerName}`)) printer.text(customerLine);
-  if (receipt.customerPhone) {
-    for (const phoneLine of wrapText(`Tél. : ${receipt.customerPhone}`)) printer.text(phoneLine);
-  }
+  const customerSummary = `Client : ${receipt.customerName}${receipt.customerPhone ? ` | ${receipt.customerPhone}` : ""}`;
+  for (const customerLine of wrapText(customerSummary)) printer.text(customerLine);
   printer.text(line).align("ct").style("b").text("ARTICLES ACHETÉS").style("normal").align("lt");
 
   for (const item of receipt.items) {
@@ -206,13 +209,6 @@ function printMainReceipt(printer, receipt) {
     for (const nameLine of wrapText(label)) printer.text(nameLine);
     const quantityLabel = `${item.quantity}${item.unit ? ` ${item.unit}` : ""} x ${money(item.unitPrice)}`;
     printer.text(columns(quantityLabel, money(item.lineTotal)));
-    if (receipt.exchangeRate > 0) {
-      printer
-        .text(columns("PU FC", `${Math.round(item.unitPrice * receipt.exchangeRate)} FC`))
-        .style("b")
-        .text(columns("Total article FC", `${Math.round(item.lineTotal * receipt.exchangeRate)} FC`))
-        .style("normal");
-    }
   }
 
   printer.text(line).text(columns("Sous-total", money(receipt.subtotal)));
@@ -391,6 +387,7 @@ router._testing = {
   PAPER_COLUMNS,
   MINIMUM_CUT_FEED,
   PRINTER_ENCODING,
+  canReprintSale,
 };
 
 module.exports = router;

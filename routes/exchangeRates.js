@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const ExchangeRate = require("../models/ExchangeRate");
 const authMiddleware = require("../middleware/auth");
+const requireModulePermission = require("../middleware/requireModulePermission");
 
 // GET current active exchange rate
 router.get("/current", async (req, res) => {
@@ -28,7 +29,7 @@ router.get("/current", async (req, res) => {
 });
 
 // GET exchange rate history (Admin only)
-router.get("/history", authMiddleware, async (req, res) => {
+router.get("/history", authMiddleware, requireModulePermission("rate"), async (req, res) => {
   try {
     // Check if user is admin
     if (req.user.role !== "admin" && req.user.role !== "manager") {
@@ -51,7 +52,7 @@ router.get("/history", authMiddleware, async (req, res) => {
 });
 
 // CREATE new exchange rate (Admin only)
-router.post("/", authMiddleware, async (req, res) => {
+router.post("/", authMiddleware, requireModulePermission("rate"), async (req, res) => {
   try {
     // Check if user is admin
     if (req.user.role !== "admin" && req.user.role !== "manager") {
@@ -102,7 +103,7 @@ router.post("/", authMiddleware, async (req, res) => {
 });
 
 // UPDATE exchange rate (Admin only)
-router.put("/:id", authMiddleware, async (req, res) => {
+router.put("/:id", authMiddleware, requireModulePermission("rate"), async (req, res) => {
   try {
     // Check if user is admin
     if (req.user.role !== "admin" && req.user.role !== "manager") {
@@ -153,7 +154,7 @@ router.put("/:id", authMiddleware, async (req, res) => {
 });
 
 // DEACTIVATE exchange rate (Admin only)
-router.patch("/:id/deactivate", authMiddleware, async (req, res) => {
+router.patch("/:id/deactivate", authMiddleware, requireModulePermission("rate"), async (req, res) => {
   try {
     // Check if user is admin
     if (req.user.role !== "admin" && req.user.role !== "manager") {

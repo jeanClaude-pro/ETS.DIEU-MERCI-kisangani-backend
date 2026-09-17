@@ -5,6 +5,7 @@ const Customer = require("../models/Customer");
 const Entry = require("../models/Entry");
 const Expense = require("../models/Expense");
 const authMiddleware = require("../middleware/auth");
+const requireModulePermission = require("../middleware/requireModulePermission");
 const { VALID_REGION_CODES } = require("../utils/regions");
 const { buildTimeframeFilter, timeframeMetadata, parseReportingDate, getTodayKisangani } = require("../utils/reportingDate");
 const { REPORTABLE_SALE_MATCH, itemSubtotal, itemRegion, scopedRevenueExpression, percentChange, dateGroup } = require("../utils/reportingPipelines");
@@ -45,7 +46,7 @@ function compactTrend(rows, idField, labelField) {
   }));
 }
 
-router.get("/analytics", authMiddleware, async (req, res) => {
+router.get("/analytics", authMiddleware, requireModulePermission("reports"), async (req, res) => {
   try {
     const region = regionFromQuery(req, res);
     if (region === null) return;
@@ -121,7 +122,7 @@ router.get("/analytics", authMiddleware, async (req, res) => {
   }
 });
 
-router.get("/dashboard", authMiddleware, async (req, res) => {
+router.get("/dashboard", authMiddleware, requireModulePermission("dashboard"), async (req, res) => {
   try {
     const region = regionFromQuery(req, res);
     if (region === null) return;
@@ -166,7 +167,7 @@ router.get("/dashboard", authMiddleware, async (req, res) => {
   }
 });
 
-router.get("/stock", authMiddleware, async (req, res) => {
+router.get("/stock", authMiddleware, requireModulePermission("reports"), async (req, res) => {
   try {
     const region = regionFromQuery(req, res);
     if (region === null) return;

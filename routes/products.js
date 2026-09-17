@@ -3,6 +3,7 @@ const router = express.Router();
 const Product = require("../models/Product");
 const authMiddleware = require("../middleware/auth");
 const isAdmin = require("../middleware/isAdmin");
+const requireModulePermission = require("../middleware/requireModulePermission");
 const { isValidRegionPair } = require("../utils/regions");
 
 // GET /api/products - Get all products with optional filtering
@@ -39,7 +40,7 @@ router.get("/", async (req, res) => {
 });
 
 // GET /api/products/:id - Get a single product by ID
-router.get("/:id", authMiddleware, async (req, res) => {
+router.get("/:id", authMiddleware, requireModulePermission("products"), async (req, res) => {
   try {
     const product = await Product.findById(req.params.id);
 

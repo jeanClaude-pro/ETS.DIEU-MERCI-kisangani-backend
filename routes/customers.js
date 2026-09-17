@@ -6,8 +6,10 @@ const { ensureWalkInCustomer } = require("../utils/walkInCustomer");
 const mongoose = require("mongoose");
 const { parsePagination } = require("../utils/reportingDate");
 const authMiddleware = require("../middleware/auth");
+const requireModulePermission = require("../middleware/requireModulePermission");
 
 router.use(authMiddleware);
+router.use(requireModulePermission("customers"));
 
 // GET /api/customers/walkin - Get the permanent system Walk-in Customer
 // (created lazily here as a fallback in case the startup bootstrap hasn't run)

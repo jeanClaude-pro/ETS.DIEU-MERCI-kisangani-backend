@@ -1,5 +1,6 @@
 const jwt = require("jsonwebtoken");
 const User = require("../models/User");
+const { isAccountUsable, statusDenialMessage } = require("../utils/userAccess");
 
 async function authMiddleware(req, res, next) {
   // Get token from header
@@ -18,6 +19,12 @@ async function authMiddleware(req, res, next) {
 
     if (!user) {
       return res.status(401).json({ message: "User not found" });
+    }
+
+    // Re-checked on every request (not just at login) so a suspended/rejected
+    // account loses access immediately, even with an already-issued token.
+    if (!isAccountUsable(user)) {
+      return res.status(401).json({ message: statusDenialMessage(user) });
     }
 
     req.user = user;

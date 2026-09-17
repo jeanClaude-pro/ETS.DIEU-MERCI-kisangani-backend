@@ -4,6 +4,7 @@ const router = express.Router();
 const User = require("../models/User");
 const bcrypt = require("bcryptjs");
 const generateToken = require("../utils/genrateToken");
+const { isAccountUsable, statusDenialMessage, sanitizeRegistrationInput } = require("../utils/userAccess");
 
 // Helper: basic field guard
 function required(...fields) {
@@ -12,7 +13,9 @@ function required(...fields) {
 
 router.post("/register", async (req, res) => {
   try {
-    let { username, email, password, role } = req.body || {};
+    // Public registration must never let the caller pick role/status/isActive
+    // or any other privileged field — only these three are ever read.
+    let { username, email, password } = sanitizeRegistrationInput(req.body);
     username = (username || "").trim();
     email = (email || "").trim().toLowerCase();
     password = String(password || "");
@@ -36,12 +39,13 @@ router.post("/register", async (req, res) => {
       username,
       email,
       password: hashedPassword,
-      role, // optional, depends on your schema defaults/validation
+      status: "pending",
+      history: [{ action: "requested" }],
     });
 
     // Keep response minimal for register; client will switch to login
     return res.status(201).json({
-      message: `Welcome ${newUser.username}, you have registered successfully`,
+      message: `Merci ${newUser.username}, votre inscription a été reçue. Un administrateur doit approuver votre compte avant que vous puissiez vous connecter.`,
     });
   } catch (error) {
     console.error("Error registering user:", error);
@@ -72,6 +76,10 @@ router.post("/login", async (req, res) => {
       return res.status(400).json({ message: "Invalid email or password" });
     }
 
+    if (!isAccountUsable(user)) {
+      return res.status(403).json({ message: statusDenialMessage(user) });
+    }
+
     // 3) Create token AFTER successful compare
     const token = generateToken({ id: user._id });
 
@@ -81,6 +89,8 @@ router.post("/login", async (req, res) => {
       username: user.username,
       email: user.email,
       role: user.role,
+      status: user.status,
+      modulePermissions: user.modulePermissions,
       createdAt: user.createdAt,
       updatedAt: user.updatedAt,
     };

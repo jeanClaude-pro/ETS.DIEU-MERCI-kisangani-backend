@@ -3,6 +3,7 @@ const router = express.Router();
 const mongoose = require("mongoose");
 const Entry = require("../models/Entry");
 const authMiddleware = require("../middleware/auth");
+const requireModulePermission = require("../middleware/requireModulePermission");
 const { isValidRegionPair } = require("../utils/regions");
 const reportingDate = require("../utils/reportingDate");
 const { buildTimeframeFilter, getTimeframeDescription, getTodayKisangani } = reportingDate;
@@ -50,7 +51,7 @@ async function getPagedEntriesWithSummary(filter, query) {
  * Timeframe filters with bounded page-based pagination
  * Priority: custom range > specific day > month > year > today (default)
  */
-router.get("/", authMiddleware, async (req, res) => {
+router.get("/", authMiddleware, requireModulePermission("entryhistory"), async (req, res) => {
   try {
     const {
       category,
@@ -245,7 +246,7 @@ router.get("/", authMiddleware, async (req, res) => {
 // ==================== ALL OTHER ROUTES ====================
 
 /** ---------- CREATE ENTRY (Everyone can create) ---------- */
-router.post("/", authMiddleware, async (req, res) => {
+router.post("/", authMiddleware, requireModulePermission("entry"), async (req, res) => {
   try {
     const {
       amount,
@@ -317,7 +318,7 @@ router.post("/", authMiddleware, async (req, res) => {
 });
 
 /** ---------- GET ENTRY BY ID ---------- */
-router.get("/:id", authMiddleware, async (req, res) => {
+router.get("/:id", authMiddleware, requireModulePermission("entryhistory"), async (req, res) => {
   try {
     const entryId = req.params.id;
     
@@ -341,7 +342,7 @@ router.get("/:id", authMiddleware, async (req, res) => {
 });
 
 /** ---------- EDIT ENTRY (Admin only) ---------- */
-router.put("/:id", authMiddleware, async (req, res) => {
+router.put("/:id", authMiddleware, requireModulePermission("entryhistory"), async (req, res) => {
   try {
     // Check if user is admin
     if (req.user.role !== "admin") {
@@ -499,7 +500,7 @@ router.put("/:id", authMiddleware, async (req, res) => {
 });
 
 /** ---------- DELETE ENTRY (Admin only - soft delete) ---------- */
-router.delete("/:id", authMiddleware, async (req, res) => {
+router.delete("/:id", authMiddleware, requireModulePermission("entryhistory"), async (req, res) => {
   try {
     // Check if user is admin
     if (req.user.role !== "admin") {
@@ -545,7 +546,7 @@ router.delete("/:id", authMiddleware, async (req, res) => {
 });
 
 /** ---------- RESTORE ENTRY (Admin only) ---------- */
-router.patch("/:id/restore", authMiddleware, async (req, res) => {
+router.patch("/:id/restore", authMiddleware, requireModulePermission("entryhistory"), async (req, res) => {
   try {
     // Check if user is admin
     if (req.user.role !== "admin") {
@@ -591,7 +592,7 @@ router.patch("/:id/restore", authMiddleware, async (req, res) => {
 });
 
 /** ---------- DAILY ENTRY STATS (like your sales stats) ---------- */
-router.get("/stats/daily", authMiddleware, async (req, res) => {
+router.get("/stats/daily", authMiddleware, requireModulePermission("entryhistory"), async (req, res) => {
   try {
     const dateStr = req.query.date || getTodayKisangani();
     const dateFilter = buildTimeframeFilter({ date: dateStr });
@@ -626,7 +627,7 @@ router.get("/stats/daily", authMiddleware, async (req, res) => {
 });
 
 /** ---------- GET ENTRY STATISTICS WITH TIMEFRAME FILTERING ---------- */
-router.get("/stats/summary", authMiddleware, async (req, res) => {
+router.get("/stats/summary", authMiddleware, requireModulePermission("entryhistory"), async (req, res) => {
   try {
     const timeframeFilter = { ...buildTimeframeFilter(req.query), status: "active" };
     const [facet = {}] = await Entry.aggregate([
@@ -663,7 +664,7 @@ router.get("/stats/summary", authMiddleware, async (req, res) => {
 });
 
 /** ---------- GET ENTRIES BY CATEGORY WITH TIMEFRAME ---------- */
-router.get("/category/:category", authMiddleware, async (req, res) => {
+router.get("/category/:category", authMiddleware, requireModulePermission("entryhistory"), async (req, res) => {
   try {
     const { category } = req.params;
     
@@ -699,7 +700,7 @@ router.get("/category/:category", authMiddleware, async (req, res) => {
 });
 
 /** ---------- GET ENTRIES BY SOURCE WITH TIMEFRAME ---------- */
-router.get("/source/:source", authMiddleware, async (req, res) => {
+router.get("/source/:source", authMiddleware, requireModulePermission("entryhistory"), async (req, res) => {
   try {
     const { source } = req.params;
     
@@ -735,7 +736,7 @@ router.get("/source/:source", authMiddleware, async (req, res) => {
 });
 
 /** ---------- GET ENTRIES BY PAYMENT METHOD WITH TIMEFRAME ---------- */
-router.get("/payment/:method", authMiddleware, async (req, res) => {
+router.get("/payment/:method", authMiddleware, requireModulePermission("entryhistory"), async (req, res) => {
   try {
     const { method } = req.params;
     
@@ -826,7 +827,7 @@ router.get("/permissions/me", authMiddleware, async (req, res) => {
 });
 
 /** ---------- GET ENTRIES HISTORY/AUDIT LOG ---------- */
-router.get("/:id/history", authMiddleware, async (req, res) => {
+router.get("/:id/history", authMiddleware, requireModulePermission("entryhistory"), async (req, res) => {
   try {
     const entry = await Entry.findById(req.params.id)
       .populate("editHistory.editedBy", "username email");

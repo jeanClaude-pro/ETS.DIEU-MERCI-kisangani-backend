@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const Expense = require("../models/Expense");
 const authMiddleware = require("../middleware/auth");
+const requireModulePermission = require("../middleware/requireModulePermission");
 const nodemailer = require("nodemailer");
 const { isValidRegionPair } = require("../utils/regions");
 const reportingDate = require("../utils/reportingDate");
@@ -274,7 +275,7 @@ function isAdminUser(user) {
  * Timeframe filters with bounded page-based pagination
  * Priority: custom range > specific day > month > year > today (default)
  */
-router.get("/", authMiddleware, async (req, res) => {
+router.get("/", authMiddleware, requireModulePermission("sortiehistory"), async (req, res) => {
   try {
     const {
       status,
@@ -453,7 +454,7 @@ router.get("/", authMiddleware, async (req, res) => {
 // ==================== ALL OTHER ROUTES ====================
 
 /** ---------- CREATE EXPENSE ---------- **/
-router.post("/", authMiddleware, async (req, res) => {
+router.post("/", authMiddleware, requireModulePermission("sortie"), async (req, res) => {
   try {
     const { reason, recipientName, recipientPhone, amount, paymentMethod, notes, recordedBy, region, regionCode } = req.body;
 
@@ -527,7 +528,7 @@ router.post("/", authMiddleware, async (req, res) => {
 });
 
 /** ---------- GET EXPENSE BY ID ---------- **/
-router.get("/:id", authMiddleware, async (req, res) => {
+router.get("/:id", authMiddleware, requireModulePermission("sortiehistory"), async (req, res) => {
   try {
     const expense = await Expense.findById(req.params.id);
     if (!expense) {
@@ -544,7 +545,7 @@ router.get("/:id", authMiddleware, async (req, res) => {
 });
 
 /** ---------- VALIDATE EXPENSE ---------- **/
-router.patch("/:id/validate", authMiddleware, async (req, res) => {
+router.patch("/:id/validate", authMiddleware, requireModulePermission("sortiehistory"), async (req, res) => {
   try {
     const { validatedBy, notes } = req.body;
     
@@ -591,7 +592,7 @@ router.patch("/:id/validate", authMiddleware, async (req, res) => {
 });
 
 /** ---------- REJECT EXPENSE ---------- **/
-router.patch("/:id/reject", authMiddleware, async (req, res) => {
+router.patch("/:id/reject", authMiddleware, requireModulePermission("sortiehistory"), async (req, res) => {
   try {
     const { reason, notes } = req.body;
     
@@ -642,7 +643,7 @@ router.patch("/:id/reject", authMiddleware, async (req, res) => {
 });
 
 /** ---------- UPDATE EXPENSE (ENHANCED FOR ALL STATUSES WITH ADMIN CHECK) ---------- **/
-router.put("/:id", authMiddleware, async (req, res) => {
+router.put("/:id", authMiddleware, requireModulePermission("sortiehistory"), async (req, res) => {
   try {
     const { reason, recipientName, recipientPhone, amount, paymentMethod, notes, updateReason, region, regionCode } = req.body;
 
@@ -763,7 +764,7 @@ router.put("/:id", authMiddleware, async (req, res) => {
 });
 
 /** ---------- ADMIN DELETE EXPENSE (FOR ANY STATUS) ---------- **/
-router.delete("/:id/admin", authMiddleware, async (req, res) => {
+router.delete("/:id/admin", authMiddleware, requireModulePermission("sortiehistory"), async (req, res) => {
   try {
     // Check if user is admin
     if (!isAdminUser(req.user)) {
@@ -807,7 +808,7 @@ router.delete("/:id/admin", authMiddleware, async (req, res) => {
 });
 
 /** ---------- REGULAR DELETE EXPENSE (FOR PENDING ONLY) ---------- **/
-router.delete("/:id", authMiddleware, async (req, res) => {
+router.delete("/:id", authMiddleware, requireModulePermission("sortiehistory"), async (req, res) => {
   try {
     const expense = await Expense.findById(req.params.id);
     if (!expense) {
@@ -847,7 +848,7 @@ router.delete("/:id", authMiddleware, async (req, res) => {
 });
 
 /** ---------- GET EXPENSE STATISTICS WITH TIMEFRAME FILTERING ---------- **/
-router.get("/stats/summary", authMiddleware, async (req, res) => {
+router.get("/stats/summary", authMiddleware, requireModulePermission("sortiehistory"), async (req, res) => {
   try {
     const timeframeFilter = buildTimeframeFilter(req.query);
     const [facet = {}] = await Expense.aggregate([
@@ -882,7 +883,7 @@ router.get("/stats/summary", authMiddleware, async (req, res) => {
 });
 
 /** ---------- GET EXPENSE HISTORY/AUDIT LOG ---------- **/
-router.get("/:id/history", authMiddleware, async (req, res) => {
+router.get("/:id/history", authMiddleware, requireModulePermission("sortiehistory"), async (req, res) => {
   try {
     const expense = await Expense.findById(req.params.id);
     if (!expense) {
@@ -920,7 +921,7 @@ router.get("/:id/history", authMiddleware, async (req, res) => {
 });
 
 /** ---------- GET EXPENSES BY RECIPIENT ---------- **/
-router.get("/recipient/:phone", authMiddleware, async (req, res) => {
+router.get("/recipient/:phone", authMiddleware, requireModulePermission("sortiehistory"), async (req, res) => {
   try {
     const { phone } = req.params;
     
@@ -960,7 +961,7 @@ router.get("/recipient/:phone", authMiddleware, async (req, res) => {
 });
 
 /** ---------- GET EXPENSES BY STATUS WITH TIMEFRAME ---------- **/
-router.get("/status/:status", authMiddleware, async (req, res) => {
+router.get("/status/:status", authMiddleware, requireModulePermission("sortiehistory"), async (req, res) => {
   try {
     const { status } = req.params;
     
