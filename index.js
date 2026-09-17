@@ -101,6 +101,13 @@ async function runMaintenanceTasks() {
       name: "ensureWalkInCustomer",
       run: () => require("./utils/walkInCustomer").ensureWalkInCustomer(),
     },
+    {
+      name: "populateDefaultCategories",
+      run: async () => {
+        const result = await require("./utils/defaultCategories").populateDefaultCategories();
+        console.log(`Categories ready: ${result.added.length} added, ${result.totalCount} total`);
+      },
+    },
   ];
   for (const task of tasks) {
     try {
