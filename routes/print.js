@@ -1,5 +1,6 @@
 const express = require("express");
 const escpos = require("escpos");
+const iconv = require("iconv-lite");
 const authMiddleware = require("../middleware/auth");
 const Sale = require("../models/Sale");
 
@@ -33,7 +34,12 @@ const numberValue = (value) => {
   return Number.isFinite(parsed) ? parsed : 0;
 };
 
-const textValue = (value) => String(value ?? "").replace(/[\r\n\t]+/g, " ").trim();
+const rawTextValue = (value) => String(value ?? "").replace(/[\r\n\t]+/g, " ").trim();
+// Convert unsupported Unicode deterministically instead of leaving conversion
+// behavior to a USB write. CP850 preserves the French accents used here and
+// iconv-lite substitutes characters outside that table with a printable '?'.
+const cp850Text = (value) => iconv.decode(iconv.encode(rawTextValue(value), PRINTER_ENCODING), PRINTER_ENCODING);
+const textValue = cp850Text;
 const money = (value) => `${numberValue(value).toFixed(2)} USD`;
 const line = "-".repeat(PAPER_COLUMNS);
 
@@ -117,7 +123,7 @@ function columns(left, right, width = PAPER_COLUMNS) {
   const safeRight = textValue(right);
   const availableLeft = Math.max(1, width - safeRight.length - 1);
   const clippedLeft = safeLeft.length > availableLeft
-    ? `${safeLeft.slice(0, Math.max(1, availableLeft - 1))}…`
+    ? `${safeLeft.slice(0, Math.max(1, availableLeft - 3))}...`
     : safeLeft;
   return `${clippedLeft}${" ".repeat(Math.max(1, width - clippedLeft.length - safeRight.length))}${safeRight}`;
 }
@@ -152,6 +158,7 @@ function closeDevice(printer) {
 
 function initializeDocument(printer) {
   printer
+    .hardware("init")
     .encode(PRINTER_ENCODING)
     .setCharacterCodeTable(CP850_CHARACTER_TABLE)
     .font("a")
@@ -176,10 +183,10 @@ function printBusinessHeader(printer) {
   printer
     .align("ct")
     .style("b")
-    .text(BUSINESS.name)
+    .text(cp850Text(BUSINESS.name))
     .style("normal");
-  for (const addressLine of wrapText(BUSINESS.address)) printer.text(addressLine);
-  for (const contactLine of wrapText(`Tél. ${BUSINESS.phone} | ${BUSINESS.registration}`)) printer.text(contactLine);
+  for (const addressLine of wrapText(BUSINESS.address)) printer.text(cp850Text(addressLine));
+  for (const contactLine of wrapText(`Tél. ${BUSINESS.phone} | ${BUSINESS.registration}`)) printer.text(cp850Text(contactLine));
 }
 
 function printMainReceipt(printer, receipt) {
@@ -205,8 +212,9 @@ function printMainReceipt(printer, receipt) {
   printer.text(line).align("ct").style("b").text("ARTICLES ACHETÉS").style("normal").align("lt");
 
   for (const item of receipt.items) {
-    const label = `${item.name}${item.regionCode ? ` (${item.regionCode})` : ""}`;
-    for (const nameLine of wrapText(label)) printer.text(nameLine);
+    // Internal Bbbb/Cnnn accounting remains in the saved sale but is not a
+    // customer-facing receipt field.
+    for (const nameLine of wrapText(item.name)) printer.text(cp850Text(nameLine));
     const quantityLabel = `${item.quantity}${item.unit ? ` ${item.unit}` : ""} x ${money(item.unitPrice)}`;
     printer.text(columns(quantityLabel, money(item.lineTotal)));
   }
@@ -260,7 +268,7 @@ function printStub(printer, receipt) {
   }
   printer.text(line).align("ct").style("b").text("ARTICLES VENDUS").style("normal").align("lt");
   for (const item of receipt.items) {
-    for (const nameLine of wrapText(item.name)) printer.text(nameLine);
+    for (const nameLine of wrapText(item.name)) printer.text(cp850Text(nameLine));
     printer.text(columns(`${item.quantity}${item.unit ? ` ${item.unit}` : ""} x ${money(item.unitPrice)}`, money(item.lineTotal)));
     if (receipt.exchangeRate > 0) {
       printer.text(columns("Total FC", `${Math.round(item.lineTotal * receipt.exchangeRate)} FC`));
@@ -282,19 +290,58 @@ function printStub(printer, receipt) {
   return printer;
 }
 
+function queuedJobByteLength(printer) {
+  const size = Number(printer?.buffer?.size);
+  if (Number.isFinite(size)) return size;
+  // Test doubles and alternate adapters may not expose MutableBuffer. The
+  // official escpos Printer does, so production always takes the branch above.
+  return Buffer.byteLength((printer?.textLines || []).join("\n"), "utf8");
+}
+
+function assertQueuedEscPosJob(printer, documentKind) {
+  const byteLength = queuedJobByteLength(printer);
+  if (!Number.isFinite(byteLength) || byteLength < 32) {
+    const error = new Error(`Empty ${documentKind} ESC/POS job rejected`);
+    error.code = "EMPTY_ESC_POS_JOB";
+    error.fallbackSafe = true;
+    throw error;
+  }
+  return byteLength;
+}
+
+async function flushDocument(printer, receipt, documentKind, flush) {
+  const byteLength = assertQueuedEscPosJob(printer, documentKind);
+  console.info("Thermal print stage queued", {
+    documentKind,
+    byteLength,
+    itemCount: receipt.items.length,
+    encoding: PRINTER_ENCODING,
+  });
+  try {
+    await flush(printer);
+  } catch (error) {
+    // Once adapter.write has started, the physical outcome cannot be inferred
+    // safely from its callback. Automatic browser fallback could duplicate it.
+    error.fallbackSafe = false;
+    throw error;
+  }
+  console.info("Thermal print stage flushed", { documentKind, byteLength });
+}
+
 async function sendReceiptThenStub(printer, receipt, flush = flushPrinter) {
   const printedDocuments = [];
   try {
     printMainReceipt(printer, receipt);
-    await flush(printer);
+    await flushDocument(printer, receipt, "receipt", flush);
     printedDocuments.push("receipt");
 
     printStub(printer, receipt);
-    await flush(printer);
+    await flushDocument(printer, receipt, "stub", flush);
     printedDocuments.push("stub");
     return printedDocuments;
   } catch (error) {
     error.printedDocuments = [...printedDocuments];
+    if (typeof error.fallbackSafe !== "boolean") error.fallbackSafe = true;
     throw error;
   }
 }
@@ -315,6 +362,7 @@ async function handleCombinedPrint(req, res) {
           success: false,
           code: "SAVED_SALE_NOT_FOUND",
           error: "Saved sale not found",
+          fallbackSafe: true,
           printedDocuments,
         });
       }
@@ -326,6 +374,7 @@ async function handleCombinedPrint(req, res) {
         success: false,
         code: "INVALID_RECEIPT_DATA",
         error: "Valid saved sale data is required",
+        fallbackSafe: true,
         printedDocuments,
       });
     }
@@ -335,6 +384,7 @@ async function handleCombinedPrint(req, res) {
         success: false,
         code: "DIRECT_PRINTER_UNAVAILABLE",
         error: "No printer found",
+        fallbackSafe: true,
         printedDocuments,
       });
     }
@@ -367,6 +417,7 @@ async function handleCombinedPrint(req, res) {
         : "DIRECT_RECEIPT_PRINT_FAILED",
       error: "Receipt and stub printing failed",
       printedDocuments,
+      fallbackSafe: error.fallbackSafe === true,
     });
   }
 }
@@ -383,6 +434,9 @@ router._testing = {
   printMainReceipt,
   printStub,
   sendReceiptThenStub,
+  assertQueuedEscPosJob,
+  queuedJobByteLength,
+  cp850Text,
   BUSINESS,
   PAPER_COLUMNS,
   MINIMUM_CUT_FEED,

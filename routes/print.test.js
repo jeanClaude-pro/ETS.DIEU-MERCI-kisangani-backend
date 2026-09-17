@@ -14,6 +14,7 @@ class FakePrinter {
   style(value) { this.operations.push(`style:${value}`); return this; }
   size(width, height) { this.operations.push(`size:${width}x${height}`); return this; }
   encode(value) { this.operations.push(`encode:${value}`); return this; }
+  hardware(value) { this.operations.push(`hardware:${value}`); return this; }
   setCharacterCodeTable(value) { this.operations.push(`table:${value}`); return this; }
   text(value) {
     this.textLines.push(String(value));
@@ -72,12 +73,13 @@ test("ESC/POS receipt is readable, wraps names, and uses minimal cut feed", () =
   assert.deepEqual(printer.cutCalls[0], { part: false, feed: MINIMUM_CUT_FEED });
   assert.equal(MINIMUM_CUT_FEED, 1);
   assert.ok(printer.operations.includes(`encode:${PRINTER_ENCODING}`));
+  assert.ok(printer.operations.includes("hardware:init"));
   assert.ok(printer.textLines.includes(BUSINESS.name));
   assert.ok(printer.textLines.includes("REÇU DE VENTE"));
   assert.ok(printer.textLines.some((value) => value.includes("Référence")));
   assert.ok(printer.textLines.some((value) => value.includes("Remise")));
   assert.ok(printer.textLines.some((value) => value.includes("TOTAL FC")));
-  assert.ok(printer.textLines.some((value) => value.includes("Bbbb")));
+  assert.equal(printer.textLines.some((value) => value.includes("Bbbb")), false);
   assert.equal(printer.textLines.some((value) => value.includes("Total article FC")), false);
   assert.ok(printer.textLines.every((value) => value.length <= PAPER_COLUMNS));
   assert.equal(printer.operations.some((value) => value.startsWith("feed:")), false);
