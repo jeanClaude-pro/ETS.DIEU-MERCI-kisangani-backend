@@ -63,6 +63,7 @@ test("ESC/POS receipt is readable, wraps names, and uses minimal cut feed", () =
     PAPER_COLUMNS,
     MINIMUM_CUT_FEED,
     PRINTER_ENCODING,
+    SYSTEM_PROMO,
   } = printRouter._testing;
   const receipt = normalizeReceiptData(savedReceipt, "sale");
   const printer = new FakePrinter();
@@ -79,6 +80,9 @@ test("ESC/POS receipt is readable, wraps names, and uses minimal cut feed", () =
   assert.ok(printer.textLines.some((value) => value.includes("Référence")));
   assert.ok(printer.textLines.some((value) => value.includes("Remise")));
   assert.ok(printer.textLines.some((value) => value.includes("TOTAL FC")));
+  assert.ok(printer.textLines.includes("UN SYSTÈME POUR VOTRE BOUTIQUE OU"));
+  assert.ok(printer.textLines.some((value) => value.includes("+243 844 311 550")));
+  assert.ok(SYSTEM_PROMO.includes("Gestion, ventes, stock & bien plus"));
   assert.equal(printer.textLines.some((value) => value.includes("Bbbb")), false);
   assert.equal(printer.textLines.some((value) => value.includes("Total article FC")), false);
   assert.ok(printer.textLines.every((value) => value.length <= PAPER_COLUMNS));

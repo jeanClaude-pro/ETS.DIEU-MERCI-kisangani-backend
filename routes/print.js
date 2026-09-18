@@ -28,6 +28,7 @@ const BUSINESS = Object.freeze({
   thankYou: "Merci pour votre confiance.",
   salesNotice: "Marchandises vendues non reprises, non échangées.",
 });
+const SYSTEM_PROMO = "UN SYSTÈME POUR VOTRE BOUTIQUE OU ENTREPRISE ? Gestion, ventes, stock & bien plus WhatsApp : +243 844 311 550";
 
 const numberValue = (value) => {
   const parsed = Number(value);
@@ -214,7 +215,9 @@ function printMainReceipt(printer, receipt) {
   for (const item of receipt.items) {
     // Internal Bbbb/Cnnn accounting remains in the saved sale but is not a
     // customer-facing receipt field.
+    printer.style("b");
     for (const nameLine of wrapText(item.name)) printer.text(cp850Text(nameLine));
+    printer.style("normal");
     const quantityLabel = `${item.quantity}${item.unit ? ` ${item.unit}` : ""} x ${money(item.unitPrice)}`;
     printer.text(columns(quantityLabel, money(item.lineTotal)));
   }
@@ -232,6 +235,9 @@ function printMainReceipt(printer, receipt) {
   }
   printer.text(`Paiement : ${receipt.paymentMethod.toUpperCase()}`);
   for (const agentLine of wrapText(`Agent de vente : ${receipt.salesPerson}`)) printer.text(agentLine);
+  printer.style("b");
+  for (const promotionLine of wrapText(SYSTEM_PROMO)) printer.text(cp850Text(promotionLine));
+  printer.style("normal");
   if (isReservation && receipt.notes) {
     for (const noteLine of wrapText(`Notes : ${receipt.notes}`)) printer.text(noteLine);
   }
@@ -268,7 +274,9 @@ function printStub(printer, receipt) {
   }
   printer.text(line).align("ct").style("b").text("ARTICLES VENDUS").style("normal").align("lt");
   for (const item of receipt.items) {
+    printer.style("b");
     for (const nameLine of wrapText(item.name)) printer.text(cp850Text(nameLine));
+    printer.style("normal");
     printer.text(columns(`${item.quantity}${item.unit ? ` ${item.unit}` : ""} x ${money(item.unitPrice)}`, money(item.lineTotal)));
     if (receipt.exchangeRate > 0) {
       printer.text(columns("Total FC", `${Math.round(item.lineTotal * receipt.exchangeRate)} FC`));
@@ -441,6 +449,7 @@ router._testing = {
   PAPER_COLUMNS,
   MINIMUM_CUT_FEED,
   PRINTER_ENCODING,
+  SYSTEM_PROMO,
   canReprintSale,
 };
 
