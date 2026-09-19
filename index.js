@@ -19,6 +19,7 @@ const PORT = process.env.PORT || 5000;
 const MONGO_URI = process.env.MONGO_URI;
 
 // ====== Use Routes ======
+app.use("/api/health", require("./routes/health"));
 app.use("/api/products", require("./routes/products"));
 app.use("/api/sales", require("./routes/sales"));
 app.use("/api/reports", require("./routes/reports"));

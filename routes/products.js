@@ -39,6 +39,23 @@ router.get("/", async (req, res) => {
   }
 });
 
+// Minimal authenticated operational dataset for the designated offline POS.
+// The public catalog remains compatible with existing screens, while offline
+// synchronization no longer depends on it or receives cost/internal fields.
+router.get("/offline-snapshot", authMiddleware, requireModulePermission("pos"), async (req, res) => {
+  try {
+    const products = await Product.find({ status: "active" })
+      .select("name category region regionCode stock minStock unit status updatedAt")
+      .sort({ name: 1 })
+      .lean();
+    res.set("Cache-Control", "no-store");
+    return res.json({ products, generatedAt: new Date().toISOString() });
+  } catch (error) {
+    console.error("Error building offline product snapshot:", error);
+    return res.status(500).json({ error: "Failed to build offline product snapshot" });
+  }
+});
+
 // GET /api/products/:id - Get a single product by ID
 router.get("/:id", authMiddleware, requireModulePermission("products"), async (req, res) => {
   try {

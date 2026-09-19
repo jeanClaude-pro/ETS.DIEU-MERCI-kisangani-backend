@@ -24,7 +24,11 @@ function statusDenialMessage(user) {
 function getEffectiveModules(user) {
   if (!user) return [];
   if (user.role === "admin") return MODULE_IDS;
-  if (Array.isArray(user.modulePermissions)) return user.modulePermissions;
+  if (Array.isArray(user.modulePermissions)) {
+    return user.modulePermissions.includes("pos") && !user.modulePermissions.includes("sync")
+      ? [...user.modulePermissions, "sync"]
+      : user.modulePermissions;
+  }
   return defaultModulesForRole(user.role);
 }
 

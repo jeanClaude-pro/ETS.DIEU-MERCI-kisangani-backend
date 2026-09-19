@@ -7,6 +7,7 @@ class FakePrinter {
     this.operations = [];
     this.textLines = [];
     this.cutCalls = [];
+    this.barcodeCalls = [];
   }
 
   font(value) { this.operations.push(`font:${value}`); return this; }
@@ -24,6 +25,11 @@ class FakePrinter {
   cut(part, feed) {
     this.cutCalls.push({ part, feed });
     this.operations.push(`cut:${feed}`);
+    return this;
+  }
+  barcode(code, type, options) {
+    this.barcodeCalls.push({ code, type, options });
+    this.operations.push(`barcode:${type}:${code}`);
     return this;
   }
 }
@@ -135,6 +141,53 @@ test("every authenticated role can reprint without receiving sale mutation right
     assert.equal(canReprintSale({ _id: "user-id", role }), true);
   }
   assert.equal(canReprintSale(null), false);
+});
+
+test("a barcode-era sale prints a native CODE128 command on both receipt and stub", () => {
+  const { normalizeReceiptData, printMainReceipt, printStub } = printRouter._testing;
+  const receipt = normalizeReceiptData({ ...savedReceipt, barcodeToken: "ABCDEFGHJKMN" }, "sale");
+  assert.equal(receipt.barcodeToken, "ABCDEFGHJKMN");
+
+  const receiptPrinter = new FakePrinter();
+  printMainReceipt(receiptPrinter, receipt);
+  assert.equal(receiptPrinter.barcodeCalls.length, 1);
+  assert.equal(receiptPrinter.barcodeCalls[0].type, "CODE128");
+  assert.equal(receiptPrinter.barcodeCalls[0].code, "{BABCDEFGHJKMN");
+  assert.equal(receiptPrinter.barcodeCalls[0].options.position, "OFF");
+
+  const stubPrinter = new FakePrinter();
+  printStub(stubPrinter, receipt);
+  assert.equal(stubPrinter.barcodeCalls.length, 1);
+  assert.equal(stubPrinter.barcodeCalls[0].code, "{BABCDEFGHJKMN");
+});
+
+test("a legacy sale without a barcodeToken prints no barcode command on either document", () => {
+  const { normalizeReceiptData, printMainReceipt, printStub } = printRouter._testing;
+  const receipt = normalizeReceiptData(savedReceipt, "sale");
+  assert.equal(receipt.barcodeToken, null);
+
+  const receiptPrinter = new FakePrinter();
+  printMainReceipt(receiptPrinter, receipt);
+  assert.equal(receiptPrinter.barcodeCalls.length, 0);
+
+  const stubPrinter = new FakePrinter();
+  printStub(stubPrinter, receipt);
+  assert.equal(stubPrinter.barcodeCalls.length, 0);
+});
+
+test("normalizeReceiptData rejects a malformed barcodeToken instead of trusting it", () => {
+  const { normalizeReceiptData } = printRouter._testing;
+  const receipt = normalizeReceiptData({ ...savedReceipt, barcodeToken: "not-a-valid-token!!" }, "sale");
+  assert.equal(receipt.barcodeToken, null);
+});
+
+test("normalizeReceiptData prefers receiptNumber over the legacy saleId for the printed reference", () => {
+  const { normalizeReceiptData } = printRouter._testing;
+  const withBoth = normalizeReceiptData({ ...savedReceipt, saleId: "SALE-LEGACY-1", receiptNumber: "ABCD-EFGH-JKMN" }, "sale");
+  assert.equal(withBoth.reference, "ABCD-EFGH-JKMN");
+
+  const legacyOnly = normalizeReceiptData({ ...savedReceipt, saleId: "SALE-LEGACY-1" }, "sale");
+  assert.equal(legacyOnly.reference, "SALE-LEGACY-1");
 });
 
 test("committed Sale documents normalize their nested snapshots", () => {

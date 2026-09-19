@@ -9,18 +9,14 @@ const authMiddleware = require("../middleware/auth");
 const requireModulePermission = require("../middleware/requireModulePermission");
 const { WALKIN_CUSTOMER_NAME, WALKIN_CUSTOMER_PHONE, resolveSaleCustomer } = require("../utils/walkInCustomer");
 const { VALID_REGION_CODES } = require("../utils/regions");
-const { buildCanonicalSaleItem, buildEditedSaleItem, calculateSaleFinancials, allocateSaleFinancialsToItems } = require("../utils/saleIntegrity");
+const { buildEditedSaleItem, calculateSaleFinancials, allocateSaleFinancialsToItems } = require("../utils/saleIntegrity");
 const { aggregateItemQuantities, calculateStockDeltas } = require("../utils/saleMutations");
 const reportingDate = require("../utils/reportingDate");
 const { buildTimeframeFilter, getTimeframeDescription, getTodayKisangani } = reportingDate;
 const { scopedRevenueExpression, buildPagedFacet } = require("../utils/reportingPipelines");
-
-class MutationError extends Error {
-  constructor(status, message) {
-    super(message);
-    this.status = status;
-  }
-}
+const { MutationError, IdempotentReplay, createSaleTransaction, validateClientOccurredAt, salePayloadMatches } = require("../utils/saleCreation");
+const { isValidBarcodeToken, isMatchingReceiptIdentity } = require("../utils/barcodeId");
+const SaleSyncConflict = require("../models/SaleSyncConflict");
 
 // A sale with no registered customer selected always falls back to the
 // permanent Walk-in Customer — the cashier is never forced to pick one.
@@ -259,6 +255,10 @@ router.post("/", authMiddleware, requireModulePermission(["pos", "reservation"])
       tax,
       transportCost,
       otherCharges,
+      clientSaleId,
+      barcodeToken,
+      receiptNumber,
+      total: requestedTotal,
       // 🔹 NEW EXPENSE FIELDS
       reason,
       recipientName,
@@ -322,106 +322,43 @@ router.post("/", authMiddleware, requireModulePermission(["pos", "reservation"])
     // Customer info is optional — a sale with no registered customer falls
     // back to the permanent Walk-in Customer (see resolveSaleCustomer above).
     const safeCustomer = resolveSaleCustomer(customer);
-    if (!items || !Array.isArray(items) || items.length === 0) {
-      return res
-        .status(400)
-        .json({ error: "Sale must contain at least one item" });
+
+    // A clientSaleId sent on the regular online path makes a lost response
+    // safely retryable too (Part V), not just offline sync. Legacy callers
+    // that don't send one behave exactly as before.
+    if (clientSaleId) {
+      const existing = await Sale.findOne({ clientSaleId });
+      if (existing) {
+        if (salePayloadMatches(existing, { items, customer: safeCustomer, total: requestedTotal, paymentMethod: normalizedPM })) {
+          return res.status(200).json(existing);
+        }
+        return res.status(409).json({ error: "Cette vente existe déjà avec un contenu différent (clientSaleId réutilisé)." });
+      }
+      if (!isMatchingReceiptIdentity(barcodeToken, receiptNumber)) {
+        return res.status(400).json({ error: "A valid matching barcodeToken and receiptNumber are required with clientSaleId" });
+      }
     }
 
-    let subtotal = 0;
-    const enrichedItems = [];
-    for (const item of items) {
-      const { productId, quantity, price } = item || {};
-      if (!productId || !quantity || quantity <= 0 || !price || price < 0) {
-        return res.status(400).json({
-          error: "Each item requires productId, quantity>0, and price>=0",
-        });
-      }
-
-      const product = await Product.findById(productId).lean();
-      if (!product)
-        return res
-          .status(400)
-          .json({ error: `Product not found: ${productId}` });
-
-      if (typeof product.stock !== "number" || product.stock < quantity) {
-        return res.status(400).json({
-          error: `Insufficient stock for ${
-            product.name || name || productId
-          }. Available: ${product.stock ?? 0}`,
-        });
-      }
-
-      if (!product.region || !product.regionCode) {
-        return res.status(400).json({
-          error: `Product "${product.name || productId}" has no region assigned. Contact an administrator.`,
-        });
-      }
-
-      const canonicalItem = buildCanonicalSaleItem(product, { quantity, price });
-      subtotal += canonicalItem.total;
-      enrichedItems.push(canonicalItem);
-    }
-
-    const financials = calculateSaleFinancials(subtotal, { discount, tax, transportCost, otherCharges });
-    const allocatedItems = allocateSaleFinancialsToItems(enrichedItems, financials);
-    const total = financials.total;
-    const saleId = `SALE-${Date.now()}-${Math.random()
-      .toString(36)
-      .substr(2, 5)
-      .toUpperCase()}`;
-
-    const saleNumber = `SN-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-
-    // UPDATED: Include type and reservation fields WITH CORRECT STATUS
-    const saleData = {
-      saleId,
-      saleNumber,
-      customer: safeCustomer,
-      customerId: null,
-      items: allocatedItems,
-      ...financials,
-      cost: allocatedItems.reduce((sum, item) => sum + item.cost, 0),
-      profit: total - allocatedItems.reduce((sum, item) => sum + item.cost, 0),
+    const result = await createSaleTransaction({
+      items,
+      safeCustomer,
+      salesPerson,
       paymentMethod: normalizedPM,
-      status: type === "reservation" ? "pending" : "completed", // ✅ FIXED: Reservations as pending (money received)
-      salesPerson: salesPerson || "Admin",
-      type: type || "sale",
-      reservationDate: reservationDate || null,
-      reservationTime: reservationTime || null,
-      notes: notes || "",
-      ...(exchangeRateSnapshot && {
-        exchangeRateSnapshot: {
-          rateId: exchangeRateSnapshot.rateId || null,
-          rate: exchangeRateSnapshot.rate || null,
-          effectiveFrom: exchangeRateSnapshot.effectiveFrom
-            ? new Date(exchangeRateSnapshot.effectiveFrom)
-            : null,
-        }
-      })
-    };
-
-    const session = await mongoose.startSession();
-    let savedSale;
-    try {
-      await session.withTransaction(async () => {
-        if (!safeCustomer.isWalkIn && safeCustomer.phone) {
-          saleData.customerId = await updateCustomerData(safeCustomer, session);
-        }
-        for (const [productId, quantity] of aggregateItemQuantities(enrichedItems)) {
-          const updated = await Product.findOneAndUpdate(
-            { _id: productId, stock: { $gte: quantity } },
-            { $inc: { stock: -quantity } },
-            { new: true, session }
-          );
-          if (!updated) throw new MutationError(409, "Stock changed for an item. Please refresh and try again.");
-        }
-        [savedSale] = await Sale.create([saleData], { session });
-        if (saleData.customerId) await recalculateCustomerStats(saleData.customerId, session);
-      });
-    } finally {
-      await session.endSession();
-    }
+      type,
+      reservationDate,
+      reservationTime,
+      notes,
+      exchangeRateSnapshot,
+      discount,
+      tax,
+      transportCost,
+      otherCharges,
+      identity: clientSaleId ? { clientSaleId, barcodeToken, receiptNumber } : undefined,
+      origin: "online",
+      updateCustomerData,
+      recalculateCustomerStats,
+    });
+    const savedSale = result instanceof IdempotentReplay ? result.existingSale : result;
 
     return res.status(201).json(savedSale);
   } catch (error) {
@@ -432,6 +369,192 @@ router.post("/", authMiddleware, requireModulePermission(["pos", "reservation"])
       return res.status(400).json({ error: errors.join(", ") });
     }
     return res.status(500).json({ error: "Failed to create sale/expense" });
+  }
+});
+
+/** ---------- OFFLINE SALE SYNC (idempotent intake for the designated offline device) ---------- **/
+router.post("/sync", authMiddleware, requireModulePermission(["pos", "reservation"]), async (req, res) => {
+  try {
+    const {
+      customer,
+      items,
+      paymentMethod,
+      salesPerson,
+      type,
+      reservationDate,
+      reservationTime,
+      notes,
+      exchangeRateSnapshot,
+      discount,
+      tax,
+      transportCost,
+      otherCharges,
+      clientSaleId,
+      barcodeToken,
+      receiptNumber,
+      clientOccurredAt,
+      total: requestedTotal,
+    } = req.body;
+
+    if (!clientSaleId || typeof clientSaleId !== "string") {
+      return res.status(400).json({ error: "clientSaleId is required for offline sync" });
+    }
+    if (!isValidBarcodeToken(barcodeToken)) {
+      return res.status(400).json({ error: "barcodeToken is missing or malformed" });
+    }
+    if (!receiptNumber || typeof receiptNumber !== "string") {
+      return res.status(400).json({ error: "receiptNumber is required" });
+    }
+    if (!isMatchingReceiptIdentity(barcodeToken, receiptNumber)) {
+      return res.status(400).json({ error: "receiptNumber does not match barcodeToken" });
+    }
+
+    const normalizedPM = normalizePaymentMethod(paymentMethod);
+    const safeCustomer = resolveSaleCustomer(customer);
+
+    // Idempotency fast path: this exact offline sale already landed. Never
+    // decided by clientSaleId alone — a semantic mismatch means the id was
+    // reused for a materially different transaction, which is a conflict,
+    // not a safe replay.
+    const existing = await Sale.findOne({ clientSaleId });
+    if (existing) {
+      if (salePayloadMatches(existing, { items, customer: safeCustomer, total: requestedTotal, paymentMethod: normalizedPM })) {
+        return res.status(200).json(existing);
+      }
+      return res.status(409).json({ error: "Cette vente existe déjà avec un contenu différent (clientSaleId réutilisé)." });
+    }
+
+    const occurredAtCheck = validateClientOccurredAt(clientOccurredAt);
+    if (!occurredAtCheck.ok) {
+      return res.status(400).json({ error: occurredAtCheck.error });
+    }
+    const createdAtOverride = occurredAtCheck.date;
+
+    const result = await createSaleTransaction({
+      items,
+      safeCustomer,
+      salesPerson,
+      paymentMethod: normalizedPM,
+      type,
+      reservationDate,
+      reservationTime,
+      notes,
+      exchangeRateSnapshot,
+      discount,
+      tax,
+      transportCost,
+      otherCharges,
+      identity: { clientSaleId, barcodeToken, receiptNumber },
+      createdAtOverride,
+      origin: req.body.origin === "online" ? "online" : "offline",
+      updateCustomerData,
+      recalculateCustomerStats,
+    });
+    const savedSale = result instanceof IdempotentReplay ? result.existingSale : result;
+
+    return res.status(201).json(savedSale);
+  } catch (error) {
+    console.error("Error synchronizing offline sale:", error);
+    if (error instanceof MutationError) return res.status(error.status).json({ error: error.message });
+    if (error.name === "ValidationError") {
+      const errors = Object.values(error.errors).map((e) => e.message);
+      return res.status(400).json({ error: errors.join(", ") });
+    }
+    return res.status(500).json({ error: "Failed to synchronize offline sale" });
+  }
+});
+
+/** ---------- BARCODE LOOKUP (receipt/stub scanning) ---------- **/
+router.get("/barcode/:token", authMiddleware, requireModulePermission(["pos", "sales", "reservation"]), async (req, res) => {
+  try {
+    const { token } = req.params;
+    if (!isValidBarcodeToken(token)) {
+      return res.status(400).json({ found: false, error: "Malformed barcode" });
+    }
+    const sale = await Sale.findOne({ barcodeToken: token }).lean();
+    if (!sale) return res.status(200).json({ found: false });
+
+    const itemCount = (sale.items || []).reduce((sum, item) => sum + (Number(item.quantity) || 0), 0);
+    const rate = sale.exchangeRateSnapshot?.rate;
+    return res.status(200).json({
+      found: true,
+      receiptNumber: sale.receiptNumber || sale.saleId,
+      occurredAt: sale.createdAt,
+      customerName: sale.customer?.isWalkIn ? "Walk-in Customer" : sale.customer?.name || "Walk-in Customer",
+      totalUSD: sale.total,
+      totalFC: rate ? Math.round(sale.total * rate) : null,
+      paymentMethod: sale.paymentMethod,
+      salesPerson: sale.salesPerson,
+      itemCount,
+      status: sale.status,
+      type: sale.type,
+    });
+  } catch (error) {
+    console.error("Error looking up sale by barcode:", error);
+    return res.status(500).json({ found: false, error: "Barcode lookup failed" });
+  }
+});
+
+/** ---------- SYNC CONFLICT REPORTING / RECONCILIATION ---------- **/
+router.post("/sync/conflicts", authMiddleware, requireModulePermission(["pos", "reservation"]), async (req, res) => {
+  try {
+    const {
+      clientSaleId, barcodeToken, receiptNumber, reason,
+      productId, productName, localQuantity, occurredAt,
+      salesPerson, region, regionCode, payload,
+    } = req.body;
+    if (!clientSaleId || !barcodeToken || !receiptNumber || !reason || !occurredAt) {
+      return res.status(400).json({ error: "clientSaleId, barcodeToken, receiptNumber, reason, and occurredAt are required" });
+    }
+    const conflict = await SaleSyncConflict.create({
+      clientSaleId,
+      barcodeToken,
+      receiptNumber,
+      reason: String(reason).slice(0, 500),
+      productId: productId || null,
+      productName: productName || "",
+      localQuantity: Number.isFinite(Number(localQuantity)) ? Number(localQuantity) : null,
+      occurredAt: new Date(occurredAt),
+      salesPerson: salesPerson || "",
+      region: region || "",
+      regionCode: regionCode || "",
+      reportedBy: req.user.id,
+      payload: payload || null,
+    });
+    return res.status(201).json(conflict);
+  } catch (error) {
+    console.error("Error recording sync conflict:", error);
+    return res.status(500).json({ error: "Failed to record sync conflict" });
+  }
+});
+
+router.get("/sync/conflicts", authMiddleware, requireModulePermission(["sync", "sales"]), async (req, res) => {
+  try {
+    const { status } = req.query;
+    const filter = status === "open" || status === "acknowledged" ? { status } : {};
+    const conflicts = await SaleSyncConflict.find(filter).sort({ createdAt: -1 }).limit(200).lean();
+    return res.status(200).json(conflicts);
+  } catch (error) {
+    console.error("Error listing sync conflicts:", error);
+    return res.status(500).json({ error: "Failed to list sync conflicts" });
+  }
+});
+
+router.patch("/sync/conflicts/:id/acknowledge", authMiddleware, requireModulePermission(["sync", "sales"]), async (req, res) => {
+  try {
+    if (!/^[a-f\d]{24}$/i.test(req.params.id)) {
+      return res.status(400).json({ error: "Invalid conflict id" });
+    }
+    const conflict = await SaleSyncConflict.findByIdAndUpdate(
+      req.params.id,
+      { status: "acknowledged", acknowledgedBy: req.user.id, acknowledgedAt: new Date() },
+      { new: true }
+    );
+    if (!conflict) return res.status(404).json({ error: "Conflict record not found" });
+    return res.status(200).json(conflict);
+  } catch (error) {
+    console.error("Error acknowledging sync conflict:", error);
+    return res.status(500).json({ error: "Failed to acknowledge sync conflict" });
   }
 });
 

@@ -59,6 +59,42 @@ const saleSchema = new mongoose.Schema({
     required: true,
     unique: true  // ← THIS creates an index automatically
   },
+  // Opaque, collision-resistant identifier encoded in the receipt/stub
+  // CODE128 barcode. Absent on sales created before barcode support —
+  // consumers must treat that as "no barcode to render", never an error.
+  barcodeToken: {
+    type: String,
+    unique: true,
+    sparse: true
+  },
+  // Human-readable, dash-grouped rendering of barcodeToken. Not a second
+  // random value: uniqueness is inherited from the token it formats.
+  receiptNumber: {
+    type: String,
+    unique: true,
+    sparse: true
+  },
+  // Idempotency key generated client-side at the moment of sale (online or
+  // offline) so a lost response / retried sync never creates a duplicate
+  // sale or double-decrements stock.
+  clientSaleId: {
+    type: String,
+    unique: true,
+    sparse: true
+  },
+  // "offline" marks a sale that was created on the designated offline
+  // laptop while disconnected and later synchronized.
+  origin: {
+    type: String,
+    enum: ["online", "offline"],
+    default: "online"
+  },
+  // When an offline sale actually reached MongoDB — distinct from
+  // createdAt, which preserves the true transaction time.
+  syncedAt: {
+    type: Date,
+    default: null
+  },
   customer: {
     name: {
       type: String,

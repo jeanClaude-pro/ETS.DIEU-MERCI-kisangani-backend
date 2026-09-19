@@ -20,6 +20,9 @@ const MODULES = [
   { id: "sortie", roles: operationalRoles },
   { id: "products", roles: ["admin", "manager", "inventory_manager"] },
   { id: "sales", roles: historyRoles },
+  { id: "sync", roles: operationalRoles },
+  // Receipt barcode scanning — useful anywhere sales are made or reviewed.
+  { id: "scanner", roles: historyRoles },
   { id: "reservations", roles: operationalRoles },
   { id: "entryhistory", roles: operationalRoles },
   { id: "sortiehistory", roles: operationalRoles },

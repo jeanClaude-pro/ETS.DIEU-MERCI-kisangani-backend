@@ -38,8 +38,8 @@ test("getEffectiveModules: unset modulePermissions falls back to the role defaul
   assert.ok(!staffModules.includes("management"));
 });
 
-test("getEffectiveModules: an explicit (even empty) array overrides the role default", () => {
-  assert.deepEqual(getEffectiveModules({ role: "staff", modulePermissions: ["pos"] }), ["pos"]);
+test("getEffectiveModules: explicit POS access includes its synchronization safety companion", () => {
+  assert.deepEqual(getEffectiveModules({ role: "staff", modulePermissions: ["pos"] }), ["pos", "sync"]);
   assert.deepEqual(getEffectiveModules({ role: "staff", modulePermissions: [] }), []);
 });
 
@@ -59,8 +59,8 @@ test("sanitizeRegistrationInput: strips role/status/isActive/modulePermissions f
 test("module id registry has the expected known ids (drift guard)", () => {
   const expected = [
     "dashboard", "rate", "pos", "reservation", "entry", "sortie", "products",
-    "sales", "reservations", "entryhistory", "sortiehistory", "reports",
-    "customers", "management",
+    "sales", "scanner", "reservations", "entryhistory", "sortiehistory", "reports",
+    "customers", "management", "sync",
   ];
   assert.deepEqual([...MODULE_IDS].sort(), [...expected].sort());
 });

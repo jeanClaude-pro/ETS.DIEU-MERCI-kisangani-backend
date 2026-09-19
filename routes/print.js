@@ -3,6 +3,7 @@ const escpos = require("escpos");
 const iconv = require("iconv-lite");
 const authMiddleware = require("../middleware/auth");
 const Sale = require("../models/Sale");
+const { isValidBarcodeToken } = require("../utils/barcodeId");
 
 escpos.USB = require("escpos-usb");
 const router = express.Router();
@@ -75,7 +76,12 @@ function normalizeReceiptData(receiptData = {}, requestedType = "sale") {
   return {
     type,
     status: textValue(receiptData.status) || (type === "reservation" ? "pending" : "completed"),
-    reference: textValue(receiptData.saleId ?? receiptData.reference ?? receiptData.receiptNumber ?? receiptData.stubNumber ?? receiptData._id) || "N/A",
+    // A receiptNumber (barcode-era sales) always wins over the legacy saleId
+    // so new receipts display the same reference that's encoded in the barcode.
+    reference: textValue(receiptData.receiptNumber ?? receiptData.saleId ?? receiptData.reference ?? receiptData.stubNumber ?? receiptData._id) || "N/A",
+    // Present only for sales created with barcode support; legacy sales
+    // simply render no barcode image.
+    barcodeToken: isValidBarcodeToken(receiptData.barcodeToken) ? receiptData.barcodeToken : null,
     date: formattedDate,
     customerName: textValue(receiptData.customer?.name ?? receiptData.customerName) || "Walk-in Customer",
     customerPhone: textValue(receiptData.customer?.phone ?? receiptData.customerPhone),
@@ -190,6 +196,18 @@ function printBusinessHeader(printer) {
   for (const contactLine of wrapText(`Tél. ${BUSINESS.phone} | ${BUSINESS.registration}`)) printer.text(cp850Text(contactLine));
 }
 
+// Native ESC/POS CODE128 command — no image rendering needed. Printed with
+// no built-in text label (position "OFF") since the human-readable
+// reference is already printed as its own line just above; that keeps the
+// barcode block compact on 80mm paper. Absent entirely on legacy sales.
+function printBarcode(printer, receipt) {
+  if (!receipt.barcodeToken) return;
+  printer.align("ct");
+  // Code Set B selector ("{B") so alphanumeric tokens encode correctly.
+  printer.barcode(`{B${receipt.barcodeToken}`, "CODE128", { width: 2, height: 50, position: "OFF" });
+  printer.align("lt");
+}
+
 function printMainReceipt(printer, receipt) {
   const isReservation = receipt.type === "reservation";
   printBusinessHeader(printer);
@@ -241,6 +259,7 @@ function printMainReceipt(printer, receipt) {
   if (isReservation && receipt.notes) {
     for (const noteLine of wrapText(`Notes : ${receipt.notes}`)) printer.text(noteLine);
   }
+  printBarcode(printer, receipt);
   printer
     .align("ct")
     .style("b")
@@ -289,6 +308,7 @@ function printStub(printer, receipt) {
     .text(columns("TOTAL", money(receipt.total)))
     .style("normal");
   for (const agentLine of wrapText(`Agent de vente : ${receipt.salesPerson}`)) printer.text(agentLine);
+  printBarcode(printer, receipt);
   printer.align("ct")
     .style("b")
     .text("SOUCHE DE CAISSE")
@@ -441,6 +461,7 @@ router._testing = {
   columns,
   printMainReceipt,
   printStub,
+  printBarcode,
   sendReceiptThenStub,
   assertQueuedEscPosJob,
   queuedJobByteLength,
