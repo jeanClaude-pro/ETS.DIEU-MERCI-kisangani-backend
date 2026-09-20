@@ -106,6 +106,42 @@ async function recalculateCustomerStats(customerId, session = null) {
 
 // ==================== MAIN SALES ENDPOINT (TIME FRAME PAGINATION) ====================
 
+/**
+ * Complete bounded business-day snapshot for the designated offline laptop.
+ * This is transaction data, not cached report totals; the client merges it
+ * with local operations by clientSaleId and can reproduce today's reads.
+ */
+router.get("/offline-snapshot", authMiddleware, requireModulePermission(["sales", "reports", "dashboard", "pos"]), async (req, res) => {
+  try {
+    const today = getTodayKisangani();
+    const range = reportingDate.buildTimeframeFilter({ date: today });
+    const maxRows = 5000;
+    const rows = await Sale.find({
+      ...range,
+      status: { $in: ["completed", "pending", null] },
+      type: { $in: ["sale", "reservation"] },
+    }).sort({ createdAt: 1, _id: 1 }).limit(maxRows + 1).lean();
+    if (rows.length > maxRows) {
+      return res.status(409).json({
+        error: "Offline snapshot exceeds the safe daily limit",
+        coverage: { start: range.createdAt.$gte, end: range.createdAt.$lte, complete: false },
+      });
+    }
+    return res.json({
+      sales: rows,
+      coverage: {
+        start: range.createdAt.$gte.toISOString(),
+        end: range.createdAt.$lte.toISOString(),
+        complete: true,
+        generatedAt: new Date().toISOString(),
+      },
+    });
+  } catch (error) {
+    console.error("Error building offline sales snapshot:", error);
+    return res.status(500).json({ error: "Failed to build offline sales snapshot" });
+  }
+});
+
 /** 
  * GET /api/sales
  * Timeframe filters with bounded page-based pagination
