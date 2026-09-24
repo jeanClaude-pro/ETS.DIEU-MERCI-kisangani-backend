@@ -66,7 +66,16 @@ router.get("/analytics", authMiddleware, requireModulePermission("reports"), asy
       Sale.aggregate([{ $match: match }, { $group: { _id: null, totalSales: { $sum: 1 }, totalRevenue: { $sum: revenue }, averageSale: { $avg: revenue } } }]),
       Sale.aggregate([{ $match: saleMatch(previousDateFilter, region) }, { $group: { _id: null, totalSales: { $sum: 1 }, totalRevenue: { $sum: revenue } } }]),
       Entry.aggregate([{ $match: { ...dateFilter, status: "active", ...(region ? { regionCode: region } : {}) } }, { $group: { _id: null, totalEntries: { $sum: "$amount" }, entryCount: { $sum: 1 } } }]),
-      Expense.aggregate([{ $match: { ...dateFilter, status: "validated", ...(region ? { regionCode: region } : {}) } }, { $group: { _id: null, totalValidatedExpenses: { $sum: "$amount" }, expenseCount: { $sum: 1 } } }]),
+      Expense.aggregate([
+        { $match: { ...dateFilter, status: "validated", ...(region ? { regionCode: region } : {}) } },
+        { $facet: {
+          summary: [{ $group: { _id: null, totalValidatedExpenses: { $sum: "$amount" }, expenseCount: { $sum: 1 } } }],
+          expenses: [
+            { $sort: { createdAt: -1, _id: -1 } },
+            { $project: { _id: 1, expenseId: 1, reason: 1, amount: 1, recipientName: 1, paymentMethod: 1, regionCode: 1, validatedAt: 1, createdAt: 1 } },
+          ],
+        } },
+      ]),
       Sale.aggregate([{ $match: { ...match, "customer.isWalkIn": { $ne: true } } }, { $group: { _id: { $ifNull: ["$customerId", { $ifNull: ["$customer.phone", "$customer.name"] }] } } }, { $count: "count" }]),
       Sale.aggregate([{ $match: { ...saleMatch(previousDateFilter, region), "customer.isWalkIn": { $ne: true } } }, { $group: { _id: { $ifNull: ["$customerId", { $ifNull: ["$customer.phone", "$customer.name"] }] } } }, { $count: "count" }]),
       Sale.aggregate([{ $match: match }, { $unwind: "$items" }, ...(itemRegionMatch ? [{ $match: itemRegionMatch }] : []), { $group: { _id: { productId: "$items.productId", name: "$items.name", regionCode: itemRegion("$items") } } }, { $count: "count" }]),
@@ -88,7 +97,9 @@ router.get("/analytics", authMiddleware, requireModulePermission("reports"), asy
 
     const totalRevenue = money(salesSummary, "totalRevenue");
     const totalEntries = money(entriesSummary, "totalEntries");
-    const totalValidatedExpenses = money(expensesSummary, "totalValidatedExpenses");
+    const expenseReport = expensesSummary[0] || { summary: [], expenses: [] };
+    const totalValidatedExpenses = money(expenseReport.summary, "totalValidatedExpenses");
+    const totalValidatedExpenseCount = money(expenseReport.summary, "expenseCount");
     const monthRows = compactTrend(monthly, "month", "monthName");
     const selectedYear = String(req.query.year || getTodayKisangani().slice(0, 4));
 
@@ -98,7 +109,8 @@ router.get("/analytics", authMiddleware, requireModulePermission("reports"), asy
       data: {
         totalSales: money(salesSummary, "totalSales"), totalRevenue,
         totalCustomers: money(customerSummary, "count"), totalProducts: money(productSummary, "count"),
-        totalValidatedExpenses, totalEntries,
+        totalValidatedExpenses, totalValidatedExpenseCount, totalEntries,
+        validatedExpenses: expenseReport.expenses || [],
         netRevenue: totalRevenue + totalEntries - totalValidatedExpenses,
         averageSale: money(salesSummary, "averageSale"),
         salesByDay: compactTrend(daily, "date", "dayName"),
