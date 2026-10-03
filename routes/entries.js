@@ -7,6 +7,41 @@ const requireModulePermission = require("../middleware/requireModulePermission")
 const { isValidRegionPair } = require("../utils/regions");
 const reportingDate = require("../utils/reportingDate");
 const { buildTimeframeFilter, getTimeframeDescription, getTodayKisangani } = reportingDate;
+const { isObjectId, toPositiveAmount, cleanString } = require("../utils/validate");
+const { audit } = require("../utils/audit");
+
+// Joined user documents expose only who did it, never history/permissions.
+const USER_SUMMARY_PIPELINE = [{ $project: { username: 1, email: 1 } }];
+
+router.param("id", (req, res, next, id) => {
+  if (!isObjectId(id)) return res.status(400).json({ error: "Invalid entry ID" });
+  next();
+});
+
+// Validates and normalizes the writable entry fields. Returns
+// { error } or { value }.
+function parseEntryInput(body) {
+  const amount = toPositiveAmount(body.amount);
+  if (amount === null) return { error: "Amount is required and must be positive" };
+  const source = cleanString(body.source, 200);
+  if (!source) return { error: "Source is required" };
+  const category = cleanString(body.category, 100);
+  if (!category) return { error: "Category is required" };
+  const description = cleanString(body.description, 1000);
+  if (description === null) return { error: "Description is too long" };
+
+  const raw = body.receivedFrom;
+  if (raw !== undefined && raw !== null && (typeof raw !== "object" || Array.isArray(raw))) {
+    return { error: "Invalid receivedFrom" };
+  }
+  const receivedFrom = {};
+  for (const [field, max] of [["name", 100], ["phone", 40], ["email", 254]]) {
+    const value = cleanString(raw?.[field], max);
+    if (value === null) return { error: `Invalid receivedFrom.${field}` };
+    if (value !== undefined) receivedFrom[field] = value;
+  }
+  return { value: { amount, source, category, description: description || "", receivedFrom } };
+}
 
 
 // Normalize payment method (same as your sales route)
@@ -29,7 +64,7 @@ async function getPagedEntriesWithSummary(filter, query) {
     { $facet: {
       entries: [
         { $sort: { createdAt: -1, _id: -1 } }, { $skip: skip }, { $limit: limit },
-        { $lookup: { from: "users", localField: "createdBy", foreignField: "_id", as: "createdByUser" } },
+        { $lookup: { from: "users", localField: "createdBy", foreignField: "_id", pipeline: USER_SUMMARY_PIPELINE, as: "createdByUser" } },
         { $set: { createdBy: { $ifNull: [{ $first: "$createdByUser" }, "$createdBy"] } } },
         { $project: { __v: 0, createdByUser: 0, "createdBy.password": 0 } },
       ],
@@ -110,7 +145,7 @@ router.get("/", authMiddleware, requireModulePermission("entryhistory"), async (
     
     // 6. Apply search filter if provided
     if (search) {
-      const escapedSearch = String(search).replace(/[|\\{}()[\]^$+*?.-]/g, "\\$&");
+      const escapedSearch = String(search).slice(0, 100).replace(/[|\\{}()[\]^$+*?.-]/g, "\\$&");
       filter.$or = [
         { entryId: { $regex: escapedSearch, $options: "i" } },
         { source: { $regex: escapedSearch, $options: "i" } },
@@ -132,8 +167,8 @@ router.get("/", authMiddleware, requireModulePermission("entryhistory"), async (
       { $facet: {
         data: [
           { $sort: { createdAt: -1, _id: -1 } }, { $skip: skip }, { $limit: limit },
-          { $lookup: { from: "users", localField: "createdBy", foreignField: "_id", as: "createdByUser" } },
-          { $lookup: { from: "users", localField: "updatedBy", foreignField: "_id", as: "updatedByUser" } },
+          { $lookup: { from: "users", localField: "createdBy", foreignField: "_id", pipeline: USER_SUMMARY_PIPELINE, as: "createdByUser" } },
+          { $lookup: { from: "users", localField: "updatedBy", foreignField: "_id", pipeline: USER_SUMMARY_PIPELINE, as: "updatedByUser" } },
           { $set: {
             createdBy: { $ifNull: [{ $first: "$createdByUser" }, "$createdBy"] },
             updatedBy: { $ifNull: [{ $first: "$updatedByUser" }, "$updatedBy"] },
@@ -249,31 +284,15 @@ router.get("/", authMiddleware, requireModulePermission("entryhistory"), async (
 router.post("/", authMiddleware, requireModulePermission("entry"), async (req, res) => {
   try {
     const {
-      amount,
-      source,
       paymentMethod,
-      category,
-      description,
-      receivedFrom,
       region,
       regionCode
     } = req.body;
 
     // Validation (like your sale validation)
-    if (!amount || amount <= 0) {
-      return res.status(400).json({
-        error: "Amount is required and must be positive"
-      });
-    }
-    if (!source) {
-      return res.status(400).json({
-        error: "Source is required"
-      });
-    }
-    if (!category) {
-      return res.status(400).json({
-        error: "Category is required"
-      });
+    const parsed = parseEntryInput(req.body);
+    if (parsed.error) {
+      return res.status(400).json({ error: parsed.error });
     }
     if (!region || !regionCode || !isValidRegionPair(region, regionCode)) {
       return res.status(400).json({
@@ -282,7 +301,7 @@ router.post("/", authMiddleware, requireModulePermission("entry"), async (req, r
     }
 
     const normalizedPM = normalizePaymentMethod(paymentMethod);
-    const entryAmount = parseFloat(amount);
+    const entryAmount = parsed.value.amount;
 
     // Generate unique entry ID (like your saleId)
     const entryId = `ENTRY-${Date.now()}-${Math.random()
@@ -293,11 +312,11 @@ router.post("/", authMiddleware, requireModulePermission("entry"), async (req, r
     const entryData = {
       entryId,
       amount: entryAmount,
-      source: source.trim(),
+      source: parsed.value.source,
       paymentMethod: normalizedPM,
-      category: category.trim(),
-      description: description ? description.trim() : "",
-      receivedFrom: receivedFrom || {},
+      category: parsed.value.category,
+      description: parsed.value.description,
+      receivedFrom: parsed.value.receivedFrom,
       createdBy: req.user.userId,
       region,
       regionCode
@@ -353,16 +372,12 @@ router.put("/:id", authMiddleware, requireModulePermission("entryhistory"), asyn
 
     const { id } = req.params;
     const {
-      amount,
-      source,
       paymentMethod,
-      category,
-      description,
-      receivedFrom,
       reason,
       region,
       regionCode
     } = req.body;
+    const { source, category, description, receivedFrom } = parseEntryInput(req.body).value || {};
 
     if ((region !== undefined || regionCode !== undefined) &&
         !isValidRegionPair(region, regionCode)) {
@@ -372,22 +387,11 @@ router.put("/:id", authMiddleware, requireModulePermission("entryhistory"), asyn
     }
 
     // Validate required fields for edit
-    if (!amount || amount <= 0) {
-      return res.status(400).json({ 
-        error: "Amount is required and must be positive" 
-      });
+    const parsed = parseEntryInput(req.body);
+    if (parsed.error) {
+      return res.status(400).json({ error: parsed.error });
     }
-    if (!source) {
-      return res.status(400).json({ 
-        error: "Source is required" 
-      });
-    }
-    if (!category) {
-      return res.status(400).json({ 
-        error: "Category is required" 
-      });
-    }
-    if (!reason || reason.trim() === "") {
+    if (typeof reason !== "string" || reason.trim() === "" || reason.length > 500) {
       return res.status(400).json({ 
         error: "Reason for editing is required" 
       });
@@ -407,7 +411,7 @@ router.put("/:id", authMiddleware, requireModulePermission("entryhistory"), asyn
     }
 
     const normalizedPM = normalizePaymentMethod(paymentMethod);
-    const entryAmount = parseFloat(amount);
+    const entryAmount = parsed.value.amount;
 
     // Track changes for audit
     const changes = new Map();
@@ -460,11 +464,11 @@ router.put("/:id", authMiddleware, requireModulePermission("entryhistory"), asyn
       id,
       {
         amount: entryAmount,
-        source: source.trim(),
+        source: parsed.value.source,
         paymentMethod: normalizedPM,
-        category: category.trim(),
-        description: description ? description.trim() : "",
-        receivedFrom: receivedFrom || {},
+        category: parsed.value.category,
+        description: parsed.value.description,
+        receivedFrom: parsed.value.receivedFrom,
         updatedBy: req.user.userId,
         ...(region !== undefined && { region }),
         ...(regionCode !== undefined && { regionCode }),
@@ -481,6 +485,12 @@ router.put("/:id", authMiddleware, requireModulePermission("entryhistory"), asyn
     ).populate("createdBy", "username")
      .populate("updatedBy", "username")
      .populate("editHistory.editedBy", "username");
+
+    await audit(req, "entry.edited", {
+      targetType: "Entry",
+      targetId: id,
+      after: { changes: Object.fromEntries(changes), reason: reason.trim() },
+    });
 
     res.json({
       message: "Entry updated successfully",
@@ -530,6 +540,8 @@ router.delete("/:id", authMiddleware, requireModulePermission("entryhistory"), a
       { new: true }
     );
 
+    await audit(req, "entry.deleted", { targetType: "Entry", targetId: entry._id, before: { amount: entry.amount, source: entry.source, status: entry.status } });
+
     res.json({ 
       message: "Entry deleted successfully", 
       entry: deletedEntry 
@@ -576,6 +588,8 @@ router.patch("/:id/restore", authMiddleware, requireModulePermission("entryhisto
       { new: true }
     );
 
+    await audit(req, "entry.restored", { targetType: "Entry", targetId: entry._id, after: { amount: entry.amount, status: "active" } });
+
     res.json({ 
       message: "Entry restored successfully", 
       entry: restoredEntry 
@@ -605,7 +619,7 @@ router.get("/stats/daily", authMiddleware, requireModulePermission("entryhistory
         paymentMethods: [{ $group: { _id: "$paymentMethod", amount: { $sum: "$amount" } } }],
         entries: [
           { $sort: { createdAt: -1, _id: -1 } }, { $skip: skip }, { $limit: limit },
-          { $lookup: { from: "users", localField: "createdBy", foreignField: "_id", as: "createdByUser" } },
+          { $lookup: { from: "users", localField: "createdBy", foreignField: "_id", pipeline: USER_SUMMARY_PIPELINE, as: "createdByUser" } },
           { $set: { createdBy: { $ifNull: [{ $first: "$createdByUser" }, "$createdBy"] } } },
           { $project: { __v: 0, createdByUser: 0, "createdBy.password": 0 } },
         ],

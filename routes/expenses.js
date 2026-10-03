@@ -6,6 +6,27 @@ const requireModulePermission = require("../middleware/requireModulePermission")
 const nodemailer = require("nodemailer");
 const { isValidRegionPair } = require("../utils/regions");
 const reportingDate = require("../utils/reportingDate");
+const requireRole = require("../middleware/requireRole");
+const { isObjectId, toPositiveAmount, cleanString, escapeRegex } = require("../utils/validate");
+const { audit } = require("../utils/audit");
+
+router.param("id", (req, res, next, id) => {
+  if (!isObjectId(id)) return res.status(400).json({ error: "Invalid expense ID" });
+  next();
+});
+
+// User-supplied text is inserted into notification e-mails as HTML.
+function esc(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (character) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;",
+  })[character]);
+}
+
+// Who recorded an expense is stored as a username (legacy rows may hold an
+// id), so ownership matches either.
+function isRecordedBy(expense, user) {
+  return Boolean(user) && (expense.recordedBy === user.username || expense.recordedBy === user.id);
+}
 const { buildTimeframeFilter, getTimeframeDescription } = reportingDate;
 
 async function getPagedExpensesWithSummary(filter, query) {
@@ -78,23 +99,23 @@ async function sendExpenseNotification(expense) {
           <div class="container">
             <div class="header">
               <h2>Nouvelle Dépense Créée</h2>
-              <p>Dépense ID: ${expense.expenseId}</p>
+              <p>Dépense ID: ${esc(expense.expenseId)}</p>
             </div>
             <div class="content">
               <div class="detail"><span class="label">Statut:</span> <strong>EN ATTENTE</strong></div>
-              <div class="detail"><span class="label">Raison:</span> ${expense.reason}</div>
-              <div class="detail"><span class="label">Bénéficiaire:</span> ${expense.recipientName}</div>
-              <div class="detail"><span class="label">Téléphone:</span> ${expense.recipientPhone}</div>
+              <div class="detail"><span class="label">Raison:</span> ${esc(expense.reason)}</div>
+              <div class="detail"><span class="label">Bénéficiaire:</span> ${esc(expense.recipientName)}</div>
+              <div class="detail"><span class="label">Téléphone:</span> ${esc(expense.recipientPhone)}</div>
               <div class="detail"><span class="label">Montant:</span> ${formattedAmount}</div>
-              <div class="detail"><span class="label">Méthode de paiement:</span> ${expense.paymentMethod}</div>
-              <div class="detail"><span class="label">Enregistré par:</span> ${expense.recordedBy}</div>
-              <div class="detail"><span class="label">Date:</span> ${new Date(expense.createdAt).toLocaleString('fr-FR')}</div>
+              <div class="detail"><span class="label">Méthode de paiement:</span> ${esc(expense.paymentMethod)}</div>
+              <div class="detail"><span class="label">Enregistré par:</span> ${esc(expense.recordedBy)}</div>
+              <div class="detail"><span class="label">Date:</span> ${esc(new Date(expense.createdAt).toLocaleString('fr-FR'))}</div>
               
               <div class="action">
                 <strong>Action Requise:</strong> Veuillez valider ou rejeter cette dépense dans le système.
               </div>
               
-              <p><a href="${process.env.APP_URL || 'http://localhost:3000'}/expenses">Cliquez ici pour accéder au système</a></p>
+              <p><a href="${esc(process.env.APP_URL || 'http://localhost:3000')}/expenses">Cliquez ici pour accéder au système</a></p>
             </div>
             <div class="footer">
               <p>Cet email a été envoyé automatiquement par le système de gestion des dépenses.</p>
@@ -147,16 +168,16 @@ async function sendExpenseUpdateNotification(expense, updatedBy, updateReason) {
           <div class="container">
             <div class="header">
               <h2>Mise à Jour de Dépense</h2>
-              <p>Dépense ID: ${expense.expenseId}</p>
+              <p>Dépense ID: ${esc(expense.expenseId)}</p>
             </div>
             <div class="content">
-              <div class="detail"><span class="label">Statut:</span> ${expense.status}</div>
-              <div class="detail"><span class="label">Raison:</span> ${expense.reason}</div>
-              <div class="detail"><span class="label">Bénéficiaire:</span> ${expense.recipientName}</div>
+              <div class="detail"><span class="label">Statut:</span> ${esc(expense.status)}</div>
+              <div class="detail"><span class="label">Raison:</span> ${esc(expense.reason)}</div>
+              <div class="detail"><span class="label">Bénéficiaire:</span> ${esc(expense.recipientName)}</div>
               <div class="detail"><span class="label">Montant:</span> ${formattedAmount}</div>
-              <div class="detail"><span class="label">Méthode de paiement:</span> ${expense.paymentMethod}</div>
-              <div class="detail"><span class="label">Mis à jour par:</span> ${updatedBy}</div>
-              <div class="detail"><span class="label">Raison de la mise à jour:</span> ${updateReason || 'Non spécifiée'}</div>
+              <div class="detail"><span class="label">Méthode de paiement:</span> ${esc(expense.paymentMethod)}</div>
+              <div class="detail"><span class="label">Mis à jour par:</span> ${esc(updatedBy)}</div>
+              <div class="detail"><span class="label">Raison de la mise à jour:</span> ${esc(updateReason || 'Non spécifiée')}</div>
               <div class="detail"><span class="label">Date de mise à jour:</span> ${new Date().toLocaleString('fr-FR')}</div>
               
               <div class="warning">
@@ -214,18 +235,18 @@ async function sendExpenseDeletionNotification(expenseInfo, deletedBy) {
           <div class="container">
             <div class="header">
               <h2>Suppression de Dépense</h2>
-              <p>Dépense ID: ${expenseInfo.expenseId}</p>
+              <p>Dépense ID: ${esc(expenseInfo.expenseId)}</p>
             </div>
             <div class="content">
               <div class="alert">
                 <strong>⚠️ ALERTE:</strong> Cette dépense a été supprimée définitivement du système.
               </div>
               
-              <div class="detail"><span class="label">Ancien statut:</span> ${expenseInfo.status}</div>
-              <div class="detail"><span class="label">Raison:</span> ${expenseInfo.reason}</div>
-              <div class="detail"><span class="label">Bénéficiaire:</span> ${expenseInfo.recipientName}</div>
+              <div class="detail"><span class="label">Ancien statut:</span> ${esc(expenseInfo.status)}</div>
+              <div class="detail"><span class="label">Raison:</span> ${esc(expenseInfo.reason)}</div>
+              <div class="detail"><span class="label">Bénéficiaire:</span> ${esc(expenseInfo.recipientName)}</div>
               <div class="detail"><span class="label">Montant:</span> ${formattedAmount}</div>
-              <div class="detail"><span class="label">Supprimé par:</span> ${deletedBy}</div>
+              <div class="detail"><span class="label">Supprimé par:</span> ${esc(deletedBy)}</div>
               <div class="detail"><span class="label">Date de suppression:</span> ${new Date().toLocaleString('fr-FR')}</div>
               
               <p><strong>Note:</strong> Cette action est permanente et ne peut pas être annulée.</p>
@@ -263,9 +284,28 @@ function sanitizeInput(input) {
   return String(input || "").trim();
 }
 
-// Helper to check if user is admin
+// Admin or manager (expense validators): may manage pending expenses.
 function isAdminUser(user) {
   return user && (user.role === 'admin' || user.isAdmin === true || user.canValidate === true);
+}
+
+// Editing validated/rejected expenses and permanent deletion: admin only.
+function isStrictAdmin(user) {
+  return user?.role === "admin";
+}
+
+function parseExpenseInput(body) {
+  const amount = toPositiveAmount(body.amount);
+  const reason = cleanString(body.reason, 500);
+  const recipientName = cleanString(body.recipientName, 100);
+  const recipientPhone = cleanString(body.recipientPhone, 40);
+  const notes = cleanString(body.notes, 1000);
+  if (!reason || !recipientName || !recipientPhone || body.amount === undefined || body.amount === null || body.amount === "") {
+    return { error: "Reason, recipientName, recipientPhone, and amount are required" };
+  }
+  if (amount === null) return { error: "Amount must be a positive number" };
+  if (notes === null) return { error: "Notes are too long" };
+  return { value: { amount, reason, recipientName, recipientPhone: recipientPhone.replace(/\s+/g, ""), notes: notes || "" } };
 }
 
 // ==================== MAIN EXPENSES ENDPOINT (TIME FRAME PAGINATION) ====================
@@ -321,13 +361,13 @@ router.get("/", authMiddleware, requireModulePermission("sortiehistory"), async 
     
     // 4. Apply recordedBy filter if provided
     if (recordedBy) {
-      const escapedRecordedBy = String(recordedBy).replace(/[|\\{}()[\]^$+*?.-]/g, "\\$&");
+      const escapedRecordedBy = String(recordedBy).slice(0, 60).replace(/[|\\{}()[\]^$+*?.-]/g, "\\$&");
       filter.recordedBy = { $regex: escapedRecordedBy, $options: "i" };
     }
     
     // 5. Apply search filter if provided
     if (search) {
-      const escapedSearch = String(search).replace(/[|\\{}()[\]^$+*?.-]/g, "\\$&");
+      const escapedSearch = String(search).slice(0, 100).replace(/[|\\{}()[\]^$+*?.-]/g, "\\$&");
       filter.$or = [
         { reason: { $regex: escapedSearch, $options: "i" } },
         { recipientName: { $regex: escapedSearch, $options: "i" } },
@@ -456,13 +496,12 @@ router.get("/", authMiddleware, requireModulePermission("sortiehistory"), async 
 /** ---------- CREATE EXPENSE ---------- **/
 router.post("/", authMiddleware, requireModulePermission("sortie"), async (req, res) => {
   try {
-    const { reason, recipientName, recipientPhone, amount, paymentMethod, notes, recordedBy, region, regionCode } = req.body;
+    const { paymentMethod, region, regionCode } = req.body;
 
     // Validation
-    if (!reason || !recipientName || !recipientPhone || !amount) {
-      return res.status(400).json({
-        error: "Reason, recipientName, recipientPhone, and amount are required"
-      });
+    const parsed = parseExpenseInput(req.body);
+    if (parsed.error) {
+      return res.status(400).json({ error: parsed.error });
     }
 
     if (!region || !regionCode || !isValidRegionPair(region, regionCode)) {
@@ -471,19 +510,15 @@ router.post("/", authMiddleware, requireModulePermission("sortie"), async (req, 
       });
     }
 
-    const expenseAmount = parseFloat(amount);
-    if (isNaN(expenseAmount) || expenseAmount <= 0) {
-      return res.status(400).json({
-        error: "Amount must be a positive number"
-      });
-    }
+    const expenseAmount = parsed.value.amount;
 
     // Sanitize inputs
-    const sanitizedReason = sanitizeInput(reason);
-    const sanitizedRecipientName = sanitizeInput(recipientName);
-    const sanitizedRecipientPhone = sanitizeInput(recipientPhone).replace(/\s+/g, "");
-    const sanitizedNotes = sanitizeInput(notes);
-    const sanitizedRecordedBy = sanitizeInput(recordedBy || req.user?.id || "Unknown");
+    const sanitizedReason = parsed.value.reason;
+    const sanitizedRecipientName = parsed.value.recipientName;
+    const sanitizedRecipientPhone = parsed.value.recipientPhone;
+    const sanitizedNotes = parsed.value.notes;
+    // Always the authenticated user — never a client-supplied name.
+    const sanitizedRecordedBy = req.user.username || req.user.id;
 
     const normalizedPM = normalizePaymentMethod(paymentMethod);
 
@@ -547,7 +582,7 @@ router.get("/:id", authMiddleware, requireModulePermission("sortiehistory"), asy
 /** ---------- VALIDATE EXPENSE ---------- **/
 router.patch("/:id/validate", authMiddleware, requireModulePermission("sortiehistory"), async (req, res) => {
   try {
-    const { validatedBy, notes } = req.body;
+    const notes = cleanString(req.body?.notes, 500);
     
     // Check authorization
     if (req.user && !req.user.canValidate) {
@@ -574,12 +609,14 @@ router.patch("/:id/validate", authMiddleware, requireModulePermission("sortiehis
       req.params.id,
       {
         status: "validated",
-        validatedBy: validatedBy || req.user?.id || "Admin",
+        validatedBy: req.user.username || req.user.id,
         validatedAt: new Date(),
         notes: updatedNotes
       },
       { new: true, runValidators: true }
     );
+
+    await audit(req, "expense.validated", { targetType: "Expense", targetId: expense._id, before: { status: expense.status }, after: { status: "validated", amount: expense.amount } });
 
     res.json(updatedExpense);
   } catch (error) {
@@ -594,7 +631,8 @@ router.patch("/:id/validate", authMiddleware, requireModulePermission("sortiehis
 /** ---------- REJECT EXPENSE ---------- **/
 router.patch("/:id/reject", authMiddleware, requireModulePermission("sortiehistory"), async (req, res) => {
   try {
-    const { reason, notes } = req.body;
+    const reason = cleanString(req.body?.reason, 500);
+    const notes = cleanString(req.body?.notes, 500);
     
     // Check authorization
     if (req.user && !req.user.canValidate) {
@@ -625,12 +663,14 @@ router.patch("/:id/reject", authMiddleware, requireModulePermission("sortiehisto
       req.params.id,
       {
         status: "rejected",
-        validatedBy: req.user?.id || "Admin",
+        validatedBy: req.user.username || req.user.id,
         validatedAt: new Date(),
         notes: updatedNotes
       },
       { new: true, runValidators: true }
     );
+
+    await audit(req, "expense.rejected", { targetType: "Expense", targetId: expense._id, before: { status: expense.status }, after: { status: "rejected", reason } });
 
     res.json(updatedExpense);
   } catch (error) {
@@ -645,13 +685,12 @@ router.patch("/:id/reject", authMiddleware, requireModulePermission("sortiehisto
 /** ---------- UPDATE EXPENSE (ENHANCED FOR ALL STATUSES WITH ADMIN CHECK) ---------- **/
 router.put("/:id", authMiddleware, requireModulePermission("sortiehistory"), async (req, res) => {
   try {
-    const { reason, recipientName, recipientPhone, amount, paymentMethod, notes, updateReason, region, regionCode } = req.body;
+    const { paymentMethod, updateReason, region, regionCode } = req.body;
 
     // Validation
-    if (!reason || !recipientName || !recipientPhone || !amount) {
-      return res.status(400).json({
-        error: "Reason, recipientName, recipientPhone, and amount are required"
-      });
+    const parsed = parseExpenseInput(req.body);
+    if (parsed.error) {
+      return res.status(400).json({ error: parsed.error });
     }
 
     if ((region !== undefined || regionCode !== undefined) &&
@@ -661,18 +700,16 @@ router.put("/:id", authMiddleware, requireModulePermission("sortiehistory"), asy
       });
     }
 
-    const expenseAmount = parseFloat(amount);
-    if (isNaN(expenseAmount) || expenseAmount <= 0) {
-      return res.status(400).json({ 
-        error: "Amount must be a positive number" 
-      });
+    const expenseAmount = parsed.value.amount;
+
+    if (updateReason !== undefined && cleanString(updateReason, 500) === null) {
+      return res.status(400).json({ error: "Invalid update reason" });
     }
 
     // Sanitize inputs
-    const sanitizedReason = sanitizeInput(reason);
-    const sanitizedRecipientName = sanitizeInput(recipientName);
-    const sanitizedRecipientPhone = sanitizeInput(recipientPhone).replace(/\s+/g, "");
-    const sanitizedNotes = sanitizeInput(notes);
+    const sanitizedReason = parsed.value.reason;
+    const sanitizedRecipientName = parsed.value.recipientName;
+    const sanitizedRecipientPhone = parsed.value.recipientPhone;
     const sanitizedUpdateReason = sanitizeInput(updateReason);
 
     const normalizedPM = normalizePaymentMethod(paymentMethod);
@@ -686,7 +723,7 @@ router.put("/:id", authMiddleware, requireModulePermission("sortiehistory"), asy
     // Authorization check for editing validated/rejected expenses
     if (existingExpense.status !== "pending") {
       // Only admins can edit validated or rejected expenses
-      if (!isAdminUser(req.user)) {
+      if (!isStrictAdmin(req.user)) {
         return res.status(403).json({ 
           error: "Only administrators can edit validated or rejected expenses" 
         });
@@ -701,8 +738,8 @@ router.put("/:id", authMiddleware, requireModulePermission("sortiehistory"), asy
     }
 
     // Check if the current user is the one who recorded it (for pending expenses)
-    if (existingExpense.status === "pending" && 
-        existingExpense.recordedBy !== req.user?.id && 
+    if (existingExpense.status === "pending" &&
+        !isRecordedBy(existingExpense, req.user) &&
         !isAdminUser(req.user)) {
       return res.status(403).json({ 
         error: "You can only edit your own pending expenses" 
@@ -724,16 +761,16 @@ router.put("/:id", authMiddleware, requireModulePermission("sortiehistory"), asy
 
     // Add notes with update history
     const updateNote = sanitizedUpdateReason ? 
-      `[${new Date().toISOString()}] Updated by ${req.user?.id || "Unknown"}: ${sanitizedUpdateReason}` : 
-      `[${new Date().toISOString()}] Updated by ${req.user?.id || "Unknown"}`;
+      `[${new Date().toISOString()}] Updated by ${req.user.username || req.user.id}: ${sanitizedUpdateReason}` : 
+      `[${new Date().toISOString()}] Updated by ${req.user.username || req.user.id}`;
     
     updateData.notes = existingExpense.notes ? 
       `${existingExpense.notes}\n${updateNote}` : 
       updateNote;
 
     // If admin is editing a validated expense, keep it validated but update validator info
-    if (existingExpense.status === "validated" && isAdminUser(req.user)) {
-      updateData.validatedBy = `${existingExpense.validatedBy || "Admin"} (Modified by: ${req.user?.id || "Admin"})`;
+    if (existingExpense.status === "validated" && isStrictAdmin(req.user)) {
+      updateData.validatedBy = `${existingExpense.validatedBy || "Admin"} (Modified by: ${req.user.username || req.user.id})`;
       updateData.validatedAt = new Date();
     }
 
@@ -743,8 +780,15 @@ router.put("/:id", authMiddleware, requireModulePermission("sortiehistory"), asy
       { new: true, runValidators: true }
     );
 
+    await audit(req, "expense.edited", {
+      targetType: "Expense",
+      targetId: existingExpense._id,
+      before: { status: existingExpense.status, amount: existingExpense.amount, reason: existingExpense.reason, recipientName: existingExpense.recipientName },
+      after: { amount: expenseAmount, reason: sanitizedReason, recipientName: sanitizedRecipientName, updateReason: sanitizedUpdateReason || null },
+    });
+
     // Send update notification
-    sendExpenseUpdateNotification(updatedExpense, req.user?.id || "Unknown", sanitizedUpdateReason);
+    sendExpenseUpdateNotification(updatedExpense, req.user.username || req.user.id, sanitizedUpdateReason);
 
     res.json({
       ...updatedExpense.toObject(),
@@ -766,10 +810,10 @@ router.put("/:id", authMiddleware, requireModulePermission("sortiehistory"), asy
 /** ---------- ADMIN DELETE EXPENSE (FOR ANY STATUS) ---------- **/
 router.delete("/:id/admin", authMiddleware, requireModulePermission("sortiehistory"), async (req, res) => {
   try {
-    // Check if user is admin
-    if (!isAdminUser(req.user)) {
-      return res.status(403).json({ 
-        error: "Only administrators can delete expenses of any status" 
+    // Permanent deletion of any status: admin only
+    if (!isStrictAdmin(req.user)) {
+      return res.status(403).json({
+        error: "Only administrators can delete expenses of any status"
       });
     }
 
@@ -789,9 +833,10 @@ router.delete("/:id/admin", authMiddleware, requireModulePermission("sortiehisto
     };
 
     await Expense.findByIdAndDelete(req.params.id);
+    await audit(req, "expense.deleted", { targetType: "Expense", targetId: expense._id, before: expense });
 
     // Send deletion notification
-    sendExpenseDeletionNotification(deletedExpenseInfo, req.user?.id || "Admin");
+    sendExpenseDeletionNotification(deletedExpenseInfo, req.user.username || req.user.id);
 
     res.json({ 
       success: true,
@@ -823,14 +868,15 @@ router.delete("/:id", authMiddleware, requireModulePermission("sortiehistory"), 
     }
 
     // Check if the current user is the one who recorded it
-    if (expense.recordedBy !== req.user?.id && !isAdminUser(req.user)) {
+    if (!isRecordedBy(expense, req.user) && !isAdminUser(req.user)) {
       return res.status(403).json({ 
         error: "You can only delete your own pending expenses" 
       });
     }
 
     await Expense.findByIdAndDelete(req.params.id);
-    res.json({ 
+    await audit(req, "expense.pending_deleted", { targetType: "Expense", targetId: expense._id, before: expense });
+    res.json({
       message: "Expense deleted successfully",
       deletedExpense: {
         id: expense._id,
@@ -937,7 +983,7 @@ router.get("/recipient/:phone", authMiddleware, requireModulePermission("sortieh
     }
 
     // Add recipient filter
-    timeframeFilter.recipientPhone = { $regex: phone, $options: "i" };
+    timeframeFilter.recipientPhone = { $regex: escapeRegex(String(phone).slice(0, 30)), $options: "i" };
 
     const { expenses, summary: totals, pagination } = await getPagedExpensesWithSummary(timeframeFilter, req.query);
 
@@ -1000,7 +1046,7 @@ router.get("/status/:status", authMiddleware, requireModulePermission("sortiehis
 });
 
 /** ---------- TEST EMAIL ENDPOINT ---------- **/
-router.get("/test/email", authMiddleware, async (req, res) => {
+router.get("/test/email", authMiddleware, requireRole("admin"), async (req, res) => {
   try {
     // Create a test expense object
     const testExpense = {
@@ -1023,15 +1069,15 @@ router.get("/test/email", authMiddleware, async (req, res) => {
     });
   } catch (error) {
     console.error("Test email error:", error);
-    res.status(500).json({ 
+    res.status(500).json({
       success: false,
-      error: error.message 
+      error: "Test email failed"
     });
   }
 });
 
 /** ---------- TEST UPDATE EMAIL ENDPOINT ---------- **/
-router.get("/test/email-update", authMiddleware, async (req, res) => {
+router.get("/test/email-update", authMiddleware, requireRole("admin"), async (req, res) => {
   try {
     // Create a test expense object
     const testExpense = {
@@ -1056,15 +1102,15 @@ router.get("/test/email-update", authMiddleware, async (req, res) => {
     });
   } catch (error) {
     console.error("Test update email error:", error);
-    res.status(500).json({ 
+    res.status(500).json({
       success: false,
-      error: error.message 
+      error: "Test email failed"
     });
   }
 });
 
 /** ---------- TEST DELETE EMAIL ENDPOINT ---------- **/
-router.get("/test/email-delete", authMiddleware, async (req, res) => {
+router.get("/test/email-delete", authMiddleware, requireRole("admin"), async (req, res) => {
   try {
     // Create a test expense info object
     const testExpenseInfo = {
@@ -1083,9 +1129,9 @@ router.get("/test/email-delete", authMiddleware, async (req, res) => {
     });
   } catch (error) {
     console.error("Test delete email error:", error);
-    res.status(500).json({ 
+    res.status(500).json({
       success: false,
-      error: error.message 
+      error: "Test email failed"
     });
   }
 });

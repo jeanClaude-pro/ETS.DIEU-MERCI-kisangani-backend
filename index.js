@@ -2,21 +2,78 @@ require("dotenv").config();
 const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
+const helmet = require("helmet");
 const morgan = require("morgan");
+const rejectMongoOperators = require("./middleware/rejectMongoOperators");
+const { notFoundHandler, errorHandler } = require("./middleware/errorHandler");
 
-const app = express();
-const printRoutes = require('./routes/print');
-
-// Middleware
-app.use(express.json());
-app.use(morgan("combined"));
-
-// ✅ Allow both local dev + Netlify frontend
-app.use(cors());
+const IS_PRODUCTION = process.env.NODE_ENV === "production";
 
 // Env variables
 const PORT = process.env.PORT || 5000;
 const MONGO_URI = process.env.MONGO_URI;
+
+// ====== Secret checks (fail fast, never print the values) ======
+const MIN_JWT_SECRET_LENGTH = 32;
+if (!MONGO_URI) {
+  console.error("❌ MONGO_URI is not set. Refusing to start.");
+  process.exit(1);
+}
+if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < MIN_JWT_SECRET_LENGTH) {
+  const message = `JWT_SECRET must be set and at least ${MIN_JWT_SECRET_LENGTH} characters long.`;
+  if (IS_PRODUCTION) {
+    console.error(`❌ ${message} Refusing to start.`);
+    process.exit(1);
+  }
+  console.warn(`⚠️ ${message} (allowed outside production only)`);
+}
+
+const app = express();
+const printRoutes = require('./routes/print');
+
+// Real client IP behind the hosting proxy (Render: one hop). Needed for the
+// login rate limiter; never `true`, which would trust spoofed headers.
+const trustProxyHops = Number.parseInt(process.env.TRUST_PROXY ?? (IS_PRODUCTION ? "1" : "0"), 10);
+app.set("trust proxy", Number.isInteger(trustProxyHops) && trustProxyHops >= 0 ? trustProxyHops : 0);
+// Express 5 default, set explicitly: query strings never become objects
+// (`?a[$ne]=x` stays a plain string key).
+app.set("query parser", "simple");
+app.disable("x-powered-by");
+
+// Security headers. The API only serves JSON, so the strict default CSP is
+// fine here; the frontend's own headers live in client/netlify.toml.
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: "same-site" },
+}));
+
+// CORS: only the configured frontend origin(s), plus local dev servers
+// outside production. Requests without an Origin (curl, health checks,
+// server-to-server) are not browser cross-origin requests and pass through.
+const DEV_ORIGINS = ["http://localhost:5173", "http://localhost:4173", "http://127.0.0.1:5173", "http://127.0.0.1:4173"];
+const allowedOrigins = new Set([
+  ...String(process.env.CLIENT_URL || "").split(",").map((origin) => origin.trim().replace(/\/$/, "")).filter(Boolean),
+  ...(IS_PRODUCTION ? [] : DEV_ORIGINS),
+]);
+if (IS_PRODUCTION && allowedOrigins.size === 0) {
+  console.warn("⚠️ CLIENT_URL is not set: browsers on other origins will be refused by CORS.");
+}
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.has(origin)) return callback(null, true);
+    return callback(new Error("Not allowed by CORS"));
+  },
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  maxAge: 600,
+}));
+
+// Middleware
+app.use(express.json({ limit: "100kb" }));
+app.use(express.urlencoded({ extended: false, limit: "100kb" }));
+app.use(rejectMongoOperators);
+// Request log without query strings (searches may contain phone numbers).
+morgan.token("path-only", (req) => (req.originalUrl || req.url || "").split("?")[0]);
+app.use(morgan(':remote-addr - :remote-user [:date[clf]] ":method :path-only HTTP/:http-version" :status :res[content-length] ":user-agent"'));
 
 // ====== Use Routes ======
 app.use("/api/health", require("./routes/health"));
@@ -31,10 +88,15 @@ app.use('/api/print', printRoutes);
 app.use("/api/expenses", require("./routes/expenses")); // ✅ Added expense routes
 app.use("/api/exchange-rates", require("./routes/exchangeRates"));
 app.use("/api/entries", require("./routes/entries"));
+app.use("/api/audit-logs", require("./routes/auditLogs"));
 // Default route
 app.get("/", (req, res) => {
   res.send("ERP/POS System Backend is running...");
 });
+
+// Must stay last: JSON 404 + error responses without stack traces.
+app.use(notFoundHandler);
+app.use(errorHandler);
 
 // ====== One-time backfill: legacy products predate the region field ======
 // All pre-existing products are known to have shipped from China, so this

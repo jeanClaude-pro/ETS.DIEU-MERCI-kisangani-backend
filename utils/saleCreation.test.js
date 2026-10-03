@@ -10,7 +10,7 @@ test("validateClientOccurredAt: no value is valid (online sales never send one)"
 
 test("validateClientOccurredAt: accepts a plausible past ISO timestamp", () => {
   const iso = "2026-09-18T10:00:00.000Z";
-  const result = validateClientOccurredAt(iso);
+  const result = validateClientOccurredAt(iso, new Date("2026-09-19T10:00:00.000Z").getTime());
   assert.equal(result.ok, true);
   assert.equal(result.date.toISOString(), iso);
 });
@@ -50,6 +50,19 @@ test("validateClientOccurredAt: preserves the exact original transaction time (P
   const result = validateClientOccurredAt(trueOccurrence, muchLaterNow);
   assert.equal(result.ok, true);
   assert.equal(result.date.toISOString(), trueOccurrence);
+});
+
+test("validateClientOccurredAt: rejects a sale backdated beyond the offline window", () => {
+  const now = new Date("2026-10-03T12:00:00.000Z").getTime();
+  const thirtyOneDaysAgo = new Date(now - 31 * 24 * 60 * 60 * 1000).toISOString();
+  const result = validateClientOccurredAt(thirtyOneDaysAgo, now, 30 * 24 * 60 * 60 * 1000);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /offline window/);
+});
+
+test("validateClientOccurredAt: rejects non-string/number values (no objects)", () => {
+  const result = validateClientOccurredAt({ $gt: "" });
+  assert.equal(result.ok, false);
 });
 
 function existingSale(overrides = {}) {

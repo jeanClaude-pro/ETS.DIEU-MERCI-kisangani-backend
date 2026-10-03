@@ -43,6 +43,12 @@ const userSchema = new mongoose.Schema(
       type: [String],
       default: undefined,
     },
+    // Incremented to revoke every previously issued JWT (password set, role
+    // change, suspension). Missing on legacy documents = 0.
+    tokenVersion: {
+      type: Number,
+      default: 0,
+    },
     approvedBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
@@ -107,6 +113,7 @@ userSchema.set("toJSON", {
     delete ret._id;
     delete ret.__v;
     delete ret.password;
+    delete ret.tokenVersion;
     return ret;
   },
 });

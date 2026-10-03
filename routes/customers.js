@@ -8,8 +8,17 @@ const { parsePagination } = require("../utils/reportingDate");
 const authMiddleware = require("../middleware/auth");
 const requireModulePermission = require("../middleware/requireModulePermission");
 
+const { isObjectId, cleanString, capLimit } = require("../utils/validate");
+const { audit } = require("../utils/audit");
+
 router.use(authMiddleware);
 router.use(requireModulePermission("customers"));
+
+// Reject malformed ids before any database call.
+router.param("id", (req, res, next, id) => {
+  if (!isObjectId(id)) return res.status(400).json({ error: "Invalid customer ID" });
+  next();
+});
 
 // GET /api/customers/walkin - Get the permanent system Walk-in Customer
 // (created lazily here as a fallback in case the startup bootstrap hasn't run)
@@ -38,7 +47,7 @@ router.get("/", async (req, res) => {
     }
 
     if (search) {
-      const escapedSearch = String(search).replace(/[|\\{}()[\]^$+*?.-]/g, "\\$&");
+      const escapedSearch = String(search).slice(0, 100).replace(/[|\\{}()[\]^$+*?.-]/g, "\\$&");
       filter.$or = [
         { name: { $regex: escapedSearch, $options: "i" } },
         { phone: { $regex: escapedSearch, $options: "i" } },
@@ -84,6 +93,9 @@ router.post("/", async (req, res) => {
     if (!name || !String(name).trim() || !phone || !String(phone).trim()) {
       return res.status(400).json({ error: "Name and phone are required" });
     }
+    if (cleanString(name, 100) === null || cleanString(phone, 40) === null || cleanString(email, 254) === null) {
+      return res.status(400).json({ error: "Name, phone or email is too long or invalid" });
+    }
 
     const customer = await Customer.create({
       name: String(name).trim(),
@@ -124,6 +136,7 @@ router.delete("/:id", async (req, res) => {
     }
 
     await Customer.deleteOne({ _id: customer._id });
+    await audit(req, "customer.deleted", { targetType: "Customer", targetId: customer._id, before: customer });
     res.json({ message: "Customer deleted", _id: customer._id });
   } catch (error) {
     console.error("Error deleting customer:", error);
@@ -160,7 +173,7 @@ router.get("/:id", async (req, res) => {
 // GET /api/customers/phone/:phone - Get customer by phone number
 router.get("/phone/:phone", async (req, res) => {
   try {
-    const customer = await Customer.findOne({ phone: req.params.phone });
+    const customer = await Customer.findOne({ phone: String(req.params.phone).slice(0, 40) });
     
     if (!customer) {
       return res.status(404).json({ error: "Customer not found" });
@@ -228,8 +241,16 @@ router.put("/:id", async (req, res) => {
     const { name, email } = req.body;
     
     const updateData = {};
-    if (name !== undefined) updateData.name = name;
-    if (email !== undefined) updateData.email = email;
+    if (name !== undefined) {
+      const cleanName = cleanString(name, 100);
+      if (!cleanName) return res.status(400).json({ error: "Name must be 1-100 characters" });
+      updateData.name = cleanName;
+    }
+    if (email !== undefined) {
+      const cleanEmail = cleanString(email, 254);
+      if (cleanEmail === null) return res.status(400).json({ error: "Invalid email" });
+      updateData.email = cleanEmail;
+    }
     
     const customer = await Customer.findByIdAndUpdate(
       req.params.id,
@@ -261,11 +282,11 @@ router.put("/:id", async (req, res) => {
 // GET /api/customers/stats/top - Get top customers by spending
 router.get("/stats/top", async (req, res) => {
   try {
-    const { limit = 10 } = req.query;
+    const limit = capLimit(req.query.limit, { defaultLimit: 10, max: 50 });
 
     const topCustomers = await Customer.find({ isWalkIn: { $ne: true } })
       .sort({ totalSpent: -1 })
-      .limit(parseInt(limit));
+      .limit(limit);
     
     res.json(topCustomers);
   } catch (error) {

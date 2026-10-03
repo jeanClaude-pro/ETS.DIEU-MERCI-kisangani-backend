@@ -27,12 +27,16 @@ async function authMiddleware(req, res, next) {
 
   // Verify the JWT itself first — a malformed/expired/forged token is a
   // genuine 401 regardless of database state, so this must not be skipped
-  // or delayed by a DB-readiness check.
+  // or delayed by a DB-readiness check. The algorithm is pinned so a token
+  // can never choose its own verification method.
   let decoded;
   try {
-    decoded = jwt.verify(token, process.env.JWT_SECRET);
+    decoded = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ["HS256"] });
   } catch (err) {
-    console.error("Invalid token:", err.message);
+    console.warn("Rejected token:", err.name);
+    return res.status(401).json({ message: "Token is not valid" });
+  }
+  if (!decoded || typeof decoded.id !== "string" || !mongoose.isValidObjectId(decoded.id)) {
     return res.status(401).json({ message: "Token is not valid" });
   }
 
@@ -63,6 +67,13 @@ async function authMiddleware(req, res, next) {
 
   if (!user) {
     return res.status(401).json({ message: "User not found" });
+  }
+
+  // Tokens issued before a password reset, role change or suspension carry
+  // an older version and are rejected. Legacy tokens/users without the
+  // field are both treated as version 0.
+  if ((decoded.tv ?? 0) !== (user.tokenVersion ?? 0)) {
+    return res.status(401).json({ message: "Token is not valid" });
   }
 
   // Re-checked on every request (not just at login) so a suspended/rejected

@@ -5,10 +5,48 @@ const authMiddleware = require("../middleware/auth");
 const isAdmin = require("../middleware/isAdmin");
 const requireModulePermission = require("../middleware/requireModulePermission");
 const { isValidRegionPair } = require("../utils/regions");
+const { hasModuleAccess } = require("../utils/userAccess");
+const { isObjectId, toFiniteNumber, cleanString, MAX_MONEY, MAX_QUANTITY } = require("../utils/validate");
+const { audit } = require("../utils/audit");
+
+// Reject malformed ids before any database call.
+router.param("id", (req, res, next, id) => {
+  if (!isObjectId(id)) return res.status(400).json({ error: "Invalid product ID" });
+  next();
+});
+
+// Cost prices are only for roles that manage products.
+function productForUser(product, user) {
+  if (!product || hasModuleAccess(user, "products")) return product;
+  const plain = typeof product.toObject === "function" ? product.toObject() : { ...product };
+  delete plain.unitCost;
+  return plain;
+}
+
+// Validates the numeric/text fields an admin may send on create/update.
+// Returns an error message, or null. Undefined fields are skipped.
+function productFieldsError(body) {
+  const numeric = {
+    stock: { min: 0, max: MAX_QUANTITY },
+    minStock: { min: 0, max: MAX_QUANTITY },
+    weight: { min: 0, max: MAX_QUANTITY },
+    unitCost: { min: 0, max: MAX_MONEY },
+  };
+  for (const [field, range] of Object.entries(numeric)) {
+    if (body[field] === undefined || body[field] === null || body[field] === "") continue;
+    if (toFiniteNumber(body[field], range) === null) return `${field} must be a number between ${range.min} and ${range.max}`;
+  }
+  const text = { name: 200, description: 2000, category: 100, brand: 100, unit: 30 };
+  for (const [field, max] of Object.entries(text)) {
+    if (body[field] === undefined) continue;
+    if (cleanString(body[field], max) === null) return `${field} must be text of at most ${max} characters`;
+  }
+  if (body.status !== undefined && !["active", "inactive"].includes(body.status)) return "Invalid status";
+  return null;
+}
 
 // GET /api/products - Get all products with optional filtering
-router.get("/", async (req, res) => {
-  console.log("Fetching products with filters:", req.query);
+router.get("/", authMiddleware, async (req, res) => {
   try {
     const { search, category, status, region } = req.query;
 
@@ -16,7 +54,7 @@ router.get("/", async (req, res) => {
     const filter = {};
 
     if (search) {
-      filter.$text = { $search: search };
+      filter.$text = { $search: String(search).slice(0, 100) };
     }
 
     if (category) {
@@ -31,7 +69,8 @@ router.get("/", async (req, res) => {
       filter.regionCode = region;
     }
 
-    const products = await Product.find(filter).sort({ createdAt: -1 });
+    const projection = hasModuleAccess(req.user, "products") ? {} : { unitCost: 0 };
+    const products = await Product.find(filter, projection).sort({ createdAt: -1 });
     res.json(products);
   } catch (error) {
     console.error("Error fetching products:", error);
@@ -65,7 +104,7 @@ router.get("/:id", authMiddleware, requireModulePermission("products"), async (r
       return res.status(404).json({ error: "Product not found" });
     }
 
-    res.json(product);
+    res.json(productForUser(product, req.user));
   } catch (error) {
     console.error("Error fetching product:", error);
 
@@ -101,6 +140,8 @@ router.post("/", authMiddleware, isAdmin, async (req, res) => {
         error: "Name and category are required fields",
       });
     }
+    const fieldsError = productFieldsError(req.body);
+    if (fieldsError) return res.status(400).json({ error: fieldsError });
 
     if (!region || !regionCode || !isValidRegionPair(region, regionCode)) {
       return res.status(400).json({
@@ -125,6 +166,11 @@ router.post("/", authMiddleware, isAdmin, async (req, res) => {
     });
 
     const savedProduct = await product.save();
+    await audit(req, "product.created", {
+      targetType: "Product",
+      targetId: savedProduct._id,
+      after: { name: savedProduct.name, stock: savedProduct.stock, unitCost: savedProduct.unitCost, status: savedProduct.status },
+    });
     res.status(201).json(savedProduct);
   } catch (error) {
     console.error("Error creating product:", error);
@@ -156,11 +202,14 @@ router.put("/:id", authMiddleware, isAdmin, async (req, res) => {
       regionCode,
     } = req.body;
 
+    const fieldsError = productFieldsError(req.body);
+    if (fieldsError) return res.status(400).json({ error: fieldsError });
+
     const existingProduct = await Product.findById(req.params.id).lean();
     if (!existingProduct) {
       return res.status(404).json({ error: "Product not found" });
     }
-    if (name !== undefined && name.trim() !== (existingProduct.originalName || existingProduct.name)) {
+    if (name !== undefined && String(name).trim() !== (existingProduct.originalName || existingProduct.name)) {
       return res.status(400).json({ error: "Product names are permanent and cannot be changed or translated" });
     }
 
@@ -196,6 +245,26 @@ router.put("/:id", authMiddleware, isAdmin, async (req, res) => {
       return res.status(404).json({ error: "Product not found" });
     }
 
+    // Direct stock edits bypass sales, so every change is traceable here
+    // (before/after), in addition to the other changed fields.
+    const before = {};
+    const after = {};
+    for (const field of Object.keys(updateData)) {
+      if (String(existingProduct[field]) !== String(updatedProduct[field])) {
+        before[field] = existingProduct[field];
+        after[field] = updatedProduct[field];
+      }
+    }
+    if (Object.keys(after).length) {
+      await audit(req, "stock" in after ? "product.stock_adjusted" : "product.updated", {
+        targetType: "Product",
+        targetId: updatedProduct._id,
+        before,
+        after,
+        meta: { name: updatedProduct.name },
+      });
+    }
+
     res.json(updatedProduct);
   } catch (error) {
     console.error("Error updating product:", error);
@@ -221,6 +290,7 @@ router.delete("/:id", authMiddleware, isAdmin, async (req, res) => {
     if (!deletedProduct) {
       return res.status(404).json({ error: "Product not found" });
     }
+    await audit(req, "product.deleted", { targetType: "Product", targetId: deletedProduct._id, before: deletedProduct });
 
     res.json({ message: "Product deleted successfully" });
   } catch (error) {

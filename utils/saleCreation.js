@@ -8,6 +8,7 @@ const {
 } = require("./saleIntegrity");
 const { aggregateItemQuantities } = require("./saleMutations");
 const { generateBarcodeToken, formatReceiptNumber } = require("./barcodeId");
+const { saleItemError, saleChargesError, toFiniteNumber } = require("./validate");
 
 class MutationError extends Error {
   constructor(status, message) {
@@ -83,18 +84,31 @@ function legacySaleNumber() {
 }
 
 const CLIENT_OCCURRED_AT_FUTURE_TOLERANCE_MS = 5 * 60 * 1000;
+const DEFAULT_OFFLINE_SALE_MAX_AGE_DAYS = 30;
+
+function offlineSaleMaxAgeMs() {
+  const days = Number(process.env.OFFLINE_SALE_MAX_AGE_DAYS);
+  return (Number.isFinite(days) && days > 0 ? days : DEFAULT_OFFLINE_SALE_MAX_AGE_DAYS) * 24 * 60 * 60 * 1000;
+}
 
 // Pure validation of the offline sale's true transaction time (Part T):
-// must be a real date and not suspiciously in the future (small clock-skew
-// tolerance only — this is a sanity check, not a security boundary).
-function validateClientOccurredAt(clientOccurredAt, now = Date.now()) {
+// must be a real date, not suspiciously in the future (small clock-skew
+// tolerance), and not older than the offline window — otherwise any POS
+// user could backdate a sale out of an already-closed day's report.
+function validateClientOccurredAt(clientOccurredAt, now = Date.now(), maxAgeMs = offlineSaleMaxAgeMs()) {
   if (!clientOccurredAt) return { ok: true, date: null };
+  if (typeof clientOccurredAt !== "string" && typeof clientOccurredAt !== "number") {
+    return { ok: false, error: "clientOccurredAt is not a valid date" };
+  }
   const parsed = new Date(clientOccurredAt);
   if (Number.isNaN(parsed.getTime())) {
     return { ok: false, error: "clientOccurredAt is not a valid date" };
   }
   if (parsed.getTime() > now + CLIENT_OCCURRED_AT_FUTURE_TOLERANCE_MS) {
     return { ok: false, error: "clientOccurredAt cannot be in the future" };
+  }
+  if (parsed.getTime() < now - maxAgeMs) {
+    return { ok: false, error: "clientOccurredAt is older than the allowed offline window" };
   }
   return { ok: true, date: parsed };
 }
@@ -139,13 +153,18 @@ async function createSaleTransaction({
     throw new MutationError(400, "Sale must contain at least one item");
   }
 
+  if (items.length > 500) throw new MutationError(400, "Too many items in one sale");
+  const chargesError = saleChargesError({ discount, tax, transportCost, otherCharges });
+  if (chargesError) throw new MutationError(400, chargesError);
+
   let subtotal = 0;
   const enrichedItems = [];
-  for (const item of items) {
-    const { productId, quantity, price } = item || {};
-    if (!productId || !quantity || quantity <= 0 || !price || price < 0) {
-      throw new MutationError(400, "Each item requires productId, quantity>0, and price>=0");
-    }
+  for (const rawItem of items) {
+    const itemError = saleItemError(rawItem);
+    if (itemError) throw new MutationError(400, itemError);
+    const productId = String(rawItem.productId);
+    const quantity = toFiniteNumber(rawItem.quantity);
+    const price = toFiniteNumber(rawItem.price);
 
     // eslint-disable-next-line no-await-in-loop
     const product = await Product.findById(productId).lean();
@@ -165,6 +184,7 @@ async function createSaleTransaction({
   }
 
   const financials = calculateSaleFinancials(subtotal, { discount, tax, transportCost, otherCharges });
+  if (financials.total < 0) throw new MutationError(400, "Discount cannot exceed the sale amount");
   const allocatedItems = allocateSaleFinancialsToItems(enrichedItems, financials);
   const total = financials.total;
 
@@ -189,14 +209,14 @@ async function createSaleTransaction({
     paymentMethod,
     status: type === "reservation" ? "pending" : "completed",
     salesPerson: salesPerson || "Admin",
-    type: type || "sale",
-    reservationDate: reservationDate || null,
-    reservationTime: reservationTime || null,
-    notes: notes || "",
-    ...(exchangeRateSnapshot && {
+    type: type === "reservation" ? "reservation" : "sale",
+    reservationDate: typeof reservationDate === "string" ? reservationDate.slice(0, 40) : null,
+    reservationTime: typeof reservationTime === "string" ? reservationTime.slice(0, 40) : null,
+    notes: typeof notes === "string" ? notes.slice(0, 1000) : "",
+    ...(exchangeRateSnapshot && typeof exchangeRateSnapshot === "object" && {
       exchangeRateSnapshot: {
         rateId: exchangeRateSnapshot.rateId || null,
-        rate: exchangeRateSnapshot.rate || null,
+        rate: toFiniteNumber(exchangeRateSnapshot.rate, { min: 0, max: 1e7, exclusiveMin: true }),
         effectiveFrom: exchangeRateSnapshot.effectiveFrom
           ? new Date(exchangeRateSnapshot.effectiveFrom)
           : null,
@@ -253,5 +273,6 @@ module.exports = {
   createSaleTransaction,
   generateUniqueIdentity,
   validateClientOccurredAt,
+  offlineSaleMaxAgeMs,
   salePayloadMatches,
 };

@@ -379,23 +379,33 @@ async function handleCombinedPrint(req, res) {
   let printedDocuments = [];
   let printer = null;
   try {
-    const savedSaleId = textValue(req.body?.savedSaleId);
-    let source = req.body?.receiptData;
-    if (savedSaleId) {
-      const savedSale = /^[a-f\d]{24}$/i.test(savedSaleId)
-        ? await Sale.findById(savedSaleId).lean()
-        : await Sale.findOne({ saleId: savedSaleId }).lean();
-      if (!savedSale) {
-        return res.status(404).json({
-          success: false,
-          code: "SAVED_SALE_NOT_FOUND",
-          error: "Saved sale not found",
-          fallbackSafe: true,
-          printedDocuments,
-        });
-      }
-      source = savedSale;
+    // The shop printer only ever prints a sale that exists in the database,
+    // rebuilt from the database — never caller-supplied receipt content,
+    // which would let anyone print a forged official receipt. Without a
+    // saved sale the client falls back to its own browser print.
+    const savedSaleId = textValue(req.body?.savedSaleId).slice(0, 100);
+    if (!savedSaleId) {
+      return res.status(400).json({
+        success: false,
+        code: "SAVED_SALE_REQUIRED",
+        error: "A saved sale is required for direct printing",
+        fallbackSafe: true,
+        printedDocuments,
+      });
     }
+    const savedSale = /^[a-f\d]{24}$/i.test(savedSaleId)
+      ? await Sale.findById(savedSaleId).lean()
+      : await Sale.findOne({ saleId: savedSaleId }).lean();
+    if (!savedSale) {
+      return res.status(404).json({
+        success: false,
+        code: "SAVED_SALE_NOT_FOUND",
+        error: "Saved sale not found",
+        fallbackSafe: true,
+        printedDocuments,
+      });
+    }
+    const source = savedSale;
     const receipt = normalizeReceiptData(source, req.body?.type);
     if (!isValidReceiptData(receipt)) {
       return res.status(400).json({
@@ -472,6 +482,7 @@ router._testing = {
   PRINTER_ENCODING,
   SYSTEM_PROMO,
   canReprintSale,
+  handleCombinedPrint,
 };
 
 module.exports = router;

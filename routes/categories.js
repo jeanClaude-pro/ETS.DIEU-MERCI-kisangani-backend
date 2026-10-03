@@ -10,12 +10,18 @@ const { cleanCategoryName, normalizeCategoryName } = require("../utils/defaultCa
 // Create a new category
 router.post("/", authMiddleware, requireModulePermission("products"), async (req, res) => {
   try {
+    if (Array.isArray(req.body) && req.body.length > 200) {
+      return res.status(400).json({ message: "Too many categories in one request" });
+    }
     const requested = (Array.isArray(req.body) ? req.body : [req.body]).map((category) => ({
       name: cleanCategoryName(category?.name),
       description: String(category?.description ?? "").trim(),
     }));
     if (requested.some((category) => !category.name)) {
       return res.status(400).json({ message: "Category name is required" });
+    }
+    if (requested.some((category) => category.name.length > 100 || category.description.length > 500)) {
+      return res.status(400).json({ message: "Category name or description is too long" });
     }
 
     const existing = await Category.find({}).select("name").lean();
