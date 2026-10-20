@@ -76,4 +76,7 @@ expenseSchema.index({ recordedBy: 1 });
 expenseSchema.index({ status: 1, createdAt: -1, _id: -1 });
 expenseSchema.index({ regionCode: 1 });
 
+// Region-scoped accounts only ever read/write their own region (utils/regionScope).
+expenseSchema.plugin(require("../utils/regionScope").regionScopePlugin);
+
 module.exports = mongoose.model("Expense", expenseSchema);

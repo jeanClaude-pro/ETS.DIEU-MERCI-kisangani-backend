@@ -16,7 +16,7 @@ function fakeRes() {
 }
 
 function signToken(payload) {
-  return jwt.sign(payload, process.env.JWT_SECRET);
+  return jwt.sign({ typ: "access", ...payload }, process.env.JWT_SECRET, { issuer: "boutique-erp", audience: "boutique-erp-app", expiresIn: 900 });
 }
 
 // mongoose.connection.readyState is a plain property on the shared singleton

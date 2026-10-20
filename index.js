@@ -29,7 +29,6 @@ if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < MIN_JWT_SECRET_LE
 }
 
 const app = express();
-const printRoutes = require('./routes/print');
 
 // Real client IP behind the hosting proxy (Render: one hop). Needed for the
 // login rate limiter; never `true`, which would trust spoofed headers.
@@ -84,7 +83,6 @@ app.use("/api/customers", require("./routes/customers"));
 app.use("/api/auth", require("./routes/auth"));
 app.use("/api/users", require("./routes/users"));
 app.use("/api/categories", require("./routes/categories"));
-app.use('/api/print', printRoutes);
 app.use("/api/expenses", require("./routes/expenses")); // ✅ Added expense routes
 app.use("/api/exchange-rates", require("./routes/exchangeRates"));
 app.use("/api/entries", require("./routes/entries"));
@@ -124,7 +122,7 @@ async function repairSaleItemSnapshots() {
   const products = await Product.find({}).select("name originalName region regionCode").lean();
   const productsById = new Map(products.map((product) => [String(product._id), product]));
   const sales = await Sale.find({
-    type: { $in: ["sale", "reservation"] },
+    type: { $in: [...require("./utils/reportingPipelines").SALE_RECORD_TYPES] },
     "items.0": { $exists: true },
   });
   let repaired = 0;
@@ -207,6 +205,9 @@ mongoose
 process.on("unhandledRejection", (reason) => {
   console.error("⚠️ Unhandled promise rejection:", reason);
 });
+// After an uncaught exception the process state can no longer be trusted:
+// log it and exit so the host restarts a clean instance.
 process.on("uncaughtException", (err) => {
-  console.error("⚠️ Uncaught exception:", err);
+  console.error("⚠️ Uncaught exception, exiting:", err);
+  process.exit(1);
 });

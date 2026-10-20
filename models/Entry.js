@@ -120,4 +120,7 @@ entrySchema.index({ source: 1 });
 entrySchema.index({ status: 1, createdAt: -1, _id: -1 });
 entrySchema.index({ regionCode: 1 });
 
+// Region-scoped accounts only ever read/write their own region (utils/regionScope).
+entrySchema.plugin(require("../utils/regionScope").regionScopePlugin);
+
 module.exports = mongoose.model("Entry", entrySchema);

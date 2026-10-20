@@ -20,8 +20,16 @@ const userSchema = new mongoose.Schema(
     },
     role: {
       type: String,
-      enum: ["admin", "manager", "inventory_manager", "cashier_supervisor", "staff"],
+      enum: ["admin", "manager", "inventory_manager", "cashier_supervisor", "staff", "shareholder"],
       default: "staff",
+    },
+    // Which region's operations the account may see: both ("all"), Butembo
+    // (Bbbb) or China (Cnnn). Admins are always "all"; shareholders are
+    // always one region. Missing on legacy accounts = "all".
+    regionScope: {
+      type: String,
+      enum: ["all", "Bbbb", "Cnnn"],
+      default: "all",
     },
     isActive: {
       type: Boolean,
@@ -68,6 +76,7 @@ const userSchema = new mongoose.Schema(
             "rejected",
             "role_changed",
             "permissions_changed",
+            "region_changed",
             "suspended",
             "reactivated",
           ],

@@ -5,6 +5,7 @@ const Entry = require("../models/Entry");
 const authMiddleware = require("../middleware/auth");
 const requireModulePermission = require("../middleware/requireModulePermission");
 const { isValidRegionPair } = require("../utils/regions");
+const { REGION_NAMES } = require("../utils/regionScope");
 const reportingDate = require("../utils/reportingDate");
 const { buildTimeframeFilter, getTimeframeDescription, getTodayKisangani } = reportingDate;
 const { isObjectId, toPositiveAmount, cleanString } = require("../utils/validate");
@@ -283,11 +284,16 @@ router.get("/", authMiddleware, requireModulePermission("entryhistory"), async (
 /** ---------- CREATE ENTRY (Everyone can create) ---------- */
 router.post("/", authMiddleware, requireModulePermission("entry"), async (req, res) => {
   try {
-    const {
+    let {
       paymentMethod,
       region,
       regionCode
     } = req.body;
+    // A region-scoped account always records in its own region.
+    if (req.regionScope) {
+      regionCode = req.regionScope;
+      region = REGION_NAMES[req.regionScope];
+    }
 
     // Validation (like your sale validation)
     const parsed = parseEntryInput(req.body);

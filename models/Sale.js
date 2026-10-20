@@ -150,6 +150,13 @@ const saleSchema = new mongoose.Schema({
     type: String,
     unique: true  // ← THIS also creates an index automatically
   },
+  // Short printed code (V-261020-K7QM3) used to find a sale from its
+  // receipt. Derived from the identity token; legacy sales have none.
+  saleCode: {
+    type: String,
+    index: true,
+    sparse: true,
+  },
   salesPerson: {
     type: String,
     required: true,

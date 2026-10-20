@@ -5,6 +5,7 @@ const authMiddleware = require("../middleware/auth");
 const requireModulePermission = require("../middleware/requireModulePermission");
 const nodemailer = require("nodemailer");
 const { isValidRegionPair } = require("../utils/regions");
+const { REGION_NAMES } = require("../utils/regionScope");
 const reportingDate = require("../utils/reportingDate");
 const requireRole = require("../middleware/requireRole");
 const { isObjectId, toPositiveAmount, cleanString, escapeRegex } = require("../utils/validate");
@@ -496,7 +497,12 @@ router.get("/", authMiddleware, requireModulePermission("sortiehistory"), async 
 /** ---------- CREATE EXPENSE ---------- **/
 router.post("/", authMiddleware, requireModulePermission("sortie"), async (req, res) => {
   try {
-    const { paymentMethod, region, regionCode } = req.body;
+    let { paymentMethod, region, regionCode } = req.body;
+    // A region-scoped account always records in its own region.
+    if (req.regionScope) {
+      regionCode = req.regionScope;
+      region = REGION_NAMES[req.regionScope];
+    }
 
     // Validation
     const parsed = parseExpenseInput(req.body);

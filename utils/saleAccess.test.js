@@ -29,13 +29,12 @@ test("saleEditDenial: an expense record stays an expense and is admin-only", () 
   assert.equal(saleEditDenial(admin, expense, "sale").status, 400);
 });
 
-test("saleEditDenial: existing reservation rules are preserved", () => {
+test("saleEditDenial: historical reservation records are edited like sales (admin only)", () => {
   const pending = { type: "reservation", status: "pending" };
-  const done = { type: "reservation", status: "completed" };
-  assert.equal(saleEditDenial(manager, pending), null);
-  assert.equal(saleEditDenial(staff, pending).status, 403);
-  assert.equal(saleEditDenial(manager, done).status, 403);
-  assert.equal(saleEditDenial(admin, done), null);
+  assert.equal(saleEditDenial(manager, pending).status, 403);
+  assert.equal(saleEditDenial(admin, pending), null);
+  // Nothing can be turned into a reservation any more.
+  assert.equal(saleEditDenial(admin, { type: "sale", status: "completed" }, "reservation").status, 400);
 });
 
 test("saleEditDenial: voided sales cannot be edited", () => {

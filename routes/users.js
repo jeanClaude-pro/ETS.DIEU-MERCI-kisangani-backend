@@ -6,6 +6,8 @@ const User = require("../models/User");
 const authMiddleware = require("../middleware/auth");
 const requireRole = require("../middleware/requireRole");
 const { ROLE_ENUM, MODULE_IDS } = require("../utils/userAccess");
+const { SHAREHOLDER_MODULES, RETIRED_MODULE_IDS } = require("../config/modulePermissions");
+const { regionScopeError } = require("../utils/regionScope");
 const { isObjectId, escapeRegex, isValidEmail, passwordPolicyError } = require("../utils/validate");
 const { unlockEmail } = require("../middleware/loginThrottle");
 const { audit } = require("../utils/audit");
@@ -19,7 +21,7 @@ router.param("userId", (req, res, next, userId) => {
   next();
 });
 
-const SAFE_FIELDS = "_id username email role status isActive modulePermissions approvedBy approvedAt createdAt updatedAt";
+const SAFE_FIELDS = "_id username email role regionScope status isActive modulePermissions approvedBy approvedAt createdAt updatedAt";
 
 // Buckets legacy documents (created before the `status` field existed) using
 // their pre-existing `isActive` value, so listing/filtering is correct even
@@ -45,11 +47,27 @@ function pushHistory(user, action, performedBy, details) {
   });
 }
 
-function validateModulePermissions(modulePermissions) {
+// Older accounts may still list modules that were removed (reservations).
+function withoutRetiredModules(modulePermissions) {
+  return Array.isArray(modulePermissions)
+    ? modulePermissions.filter((id) => !RETIRED_MODULE_IDS.includes(id))
+    : modulePermissions;
+}
+
+function validateModulePermissions(modulePermissions, role) {
   if (!Array.isArray(modulePermissions)) return "modulePermissions must be an array";
   const unknown = modulePermissions.filter((id) => !MODULE_IDS.includes(id));
   if (unknown.length) return `Unknown module id(s): ${unknown.join(", ")}`;
+  if (role === "shareholder") {
+    const operational = modulePermissions.filter((id) => !SHAREHOLDER_MODULES.includes(id));
+    if (operational.length) return `A shareholder can only consult: ${SHAREHOLDER_MODULES.join(", ")}`;
+  }
   return null;
+}
+
+// Admins always see both regions; a missing scope means both.
+function normalizedScope(role, regionScope) {
+  return role === "admin" ? "all" : (regionScope ?? "all");
 }
 
 function isSelf(req) {
@@ -86,6 +104,7 @@ function userSnapshot(user) {
     username: user.username,
     email: user.email,
     role: user.role,
+    regionScope: user.regionScope,
     status: user.status,
     isActive: user.isActive,
     modulePermissions: user.modulePermissions,
@@ -214,9 +233,17 @@ router.get("/:userId", requireRole("admin"), async (req, res) => {
 router.post("/", requireRole("admin"), async (req, res) => {
   try {
     const { username, email, password, role } = req.body;
+    const modulePermissions = withoutRetiredModules(req.body.modulePermissions);
 
     if (!ROLE_ENUM.includes(role)) {
       return res.status(400).json({ message: "Invalid role" });
+    }
+    const regionScope = normalizedScope(role, req.body.regionScope);
+    const scopeError = regionScopeError(role, regionScope);
+    if (scopeError) return res.status(400).json({ message: scopeError });
+    if (modulePermissions !== undefined && role !== "admin") {
+      const modulesError = validateModulePermissions(modulePermissions, role);
+      if (modulesError) return res.status(400).json({ message: modulesError });
     }
     if (typeof username !== "string" || !username.trim() || username.trim().length > 60) {
       return res.status(400).json({ message: "A username of at most 60 characters is required" });
@@ -236,6 +263,8 @@ router.post("/", requireRole("admin"), async (req, res) => {
       email: normalizedEmail,
       password: hashedPassword,
       role,
+      regionScope,
+      ...(Array.isArray(modulePermissions) && role !== "admin" && { modulePermissions }),
       status: "active",
       approvedBy: req.user._id,
       approvedAt: new Date(),
@@ -244,7 +273,7 @@ router.post("/", requireRole("admin"), async (req, res) => {
           action: "approved",
           performedBy: req.user._id,
           performedByUsername: req.user.username,
-          details: { createdDirectlyByAdmin: true, role },
+          details: { createdDirectlyByAdmin: true, role, regionScope },
         },
       ],
     });
@@ -266,7 +295,8 @@ router.post("/", requireRole("admin"), async (req, res) => {
 // Approve a pending request: assign role + modules, activate (Admin only)
 router.patch("/:userId/approve", requireRole("admin"), async (req, res) => {
   try {
-    const { role, modulePermissions } = req.body;
+    const { role } = req.body;
+    const modulePermissions = withoutRetiredModules(req.body.modulePermissions);
 
     if (isSelf(req)) {
       return res.status(400).json({ message: "Cannot approve your own account" });
@@ -277,10 +307,13 @@ router.patch("/:userId/approve", requireRole("admin"), async (req, res) => {
 
     let modules;
     if (role !== "admin") {
-      const error = validateModulePermissions(modulePermissions || []);
+      const error = validateModulePermissions(modulePermissions || [], role);
       if (error) return res.status(400).json({ message: error });
       modules = modulePermissions || [];
     }
+    const regionScope = normalizedScope(role, req.body.regionScope);
+    const scopeError = regionScopeError(role, regionScope);
+    if (scopeError) return res.status(400).json({ message: scopeError });
 
     const user = await User.findById(req.params.userId);
     if (!user) return res.status(404).json({ message: "User not found" });
@@ -292,6 +325,7 @@ router.patch("/:userId/approve", requireRole("admin"), async (req, res) => {
 
     const before = userSnapshot(user);
     user.role = role;
+    user.regionScope = regionScope;
     user.modulePermissions = modules;
     user.status = "active";
     user.approvedBy = req.user._id;
@@ -402,10 +436,21 @@ router.put("/:userId/role", requireRole("admin"), async (req, res) => {
       return res.status(400).json({ message: LAST_ADMIN_MESSAGE });
     }
 
+    // Role and region are validated together (a shareholder needs one region).
+    const regionScope = normalizedScope(role, req.body.regionScope ?? user.regionScope);
+    const scopeError = regionScopeError(role, regionScope);
+    if (scopeError) return res.status(400).json({ message: scopeError });
+
     const from = user.role;
+    const fromScope = user.regionScope || "all";
     user.role = role;
-    if (from !== role) revokeTokens(user);
+    user.regionScope = regionScope;
+    if (role === "shareholder" && Array.isArray(user.modulePermissions)) {
+      user.modulePermissions = user.modulePermissions.filter((id) => SHAREHOLDER_MODULES.includes(id));
+    }
+    if (from !== role || fromScope !== regionScope) revokeTokens(user);
     pushHistory(user, "role_changed", req.user, { from, to: role });
+    if (fromScope !== regionScope) pushHistory(user, "region_changed", req.user, { from: fromScope, to: regionScope });
     await user.save();
     await audit(req, "user.role_changed", { targetType: "User", targetId: user._id, before: { role: from }, after: { role } });
 
@@ -416,15 +461,39 @@ router.put("/:userId/role", requireRole("admin"), async (req, res) => {
   }
 });
 
+// Change which region(s) an account can see (Admin only). Signs the user
+// out everywhere so their device reloads data for the new scope.
+router.put("/:userId/region", requireRole("admin"), async (req, res) => {
+  try {
+    const user = await User.findById(req.params.userId);
+    if (!user) return res.status(404).json({ message: "User not found" });
+    const regionScope = normalizedScope(user.role, req.body?.regionScope);
+    const scopeError = regionScopeError(user.role, regionScope);
+    if (scopeError) return res.status(400).json({ message: scopeError });
+
+    const from = user.regionScope || "all";
+    if (from !== regionScope) {
+      user.regionScope = regionScope;
+      revokeTokens(user);
+      pushHistory(user, "region_changed", req.user, { from, to: regionScope });
+      await user.save();
+      await audit(req, "user.region_changed", { targetType: "User", targetId: user._id, before: { regionScope: from }, after: { regionScope } });
+    }
+    res.json(await User.findById(user._id).select(SAFE_FIELDS));
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: "Internal server error" });
+  }
+});
+
 // Update per-user module permissions (Admin only)
 router.put("/:userId/modules", requireRole("admin"), async (req, res) => {
   try {
-    const { modulePermissions } = req.body;
-    const error = validateModulePermissions(modulePermissions);
-    if (error) return res.status(400).json({ message: error });
-
+    const modulePermissions = withoutRetiredModules(req.body.modulePermissions);
     const user = await User.findById(req.params.userId);
     if (!user) return res.status(404).json({ message: "User not found" });
+    const error = validateModulePermissions(modulePermissions, user.role);
+    if (error) return res.status(400).json({ message: error });
 
     const before = { modulePermissions: user.modulePermissions };
     user.modulePermissions = modulePermissions;

@@ -90,6 +90,9 @@ productSchema.index({ status: 1 });
 productSchema.index({ regionCode: 1 });
 
 // Reuse if it already exists (prevents OverwriteModelError)
+// Region-scoped accounts only ever read/write their own region (utils/regionScope).
+productSchema.plugin(require("../utils/regionScope").regionScopePlugin);
+
 const Product =
   mongoose.models.Product || mongoose.model("Product", productSchema);
 

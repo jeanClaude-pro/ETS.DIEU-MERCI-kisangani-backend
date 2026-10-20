@@ -1,7 +1,11 @@
-const jwt = require("jsonwebtoken");
+const { verifyAccessToken } = require("../utils/sessionTokens");
 const mongoose = require("mongoose");
 const User = require("../models/User");
 const { isAccountUsable, statusDenialMessage } = require("../utils/userAccess");
+const { userRegionScope, isReadOnlyRole, runWithRegionScope } = require("../utils/regionScope");
+
+// Self-service writes a read-only (shareholder) account may still make.
+const READ_ONLY_ALLOWED_WRITES = [/^\/api\/users\/me\/password$/];
 
 // Errors that mean "the database itself couldn't be reached/queried" as
 // opposed to "the token/user is invalid". These must never be reported as
@@ -31,10 +35,15 @@ async function authMiddleware(req, res, next) {
   // can never choose its own verification method.
   let decoded;
   try {
-    decoded = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ["HS256"] });
+    decoded = verifyAccessToken(token);
   } catch (err) {
+    // An expired access token is the normal end of its 15 minutes: the
+    // client renews it silently with its refresh token and retries.
+    if (err.name === "TokenExpiredError") {
+      return res.status(401).json({ message: "Token expired", code: "TOKEN_EXPIRED" });
+    }
     console.warn("Rejected token:", err.name);
-    return res.status(401).json({ message: "Token is not valid" });
+    return res.status(401).json({ message: "Token is not valid", code: "TOKEN_INVALID" });
   }
   if (!decoded || typeof decoded.id !== "string" || !mongoose.isValidObjectId(decoded.id)) {
     return res.status(401).json({ message: "Token is not valid" });
@@ -92,7 +101,18 @@ async function authMiddleware(req, res, next) {
   req.user.id = user._id.toString();
   req.user.userId = user._id.toString();
 
-  next(); // continue to next middleware/route
+  // Shareholders consult only: every write is refused here, whatever the
+  // route's own checks, so no endpoint can be missed.
+  const path = (req.originalUrl || "").split("?")[0];
+  if (isReadOnlyRole(user) && !["GET", "HEAD", "OPTIONS"].includes(req.method) &&
+      !READ_ONLY_ALLOWED_WRITES.some((pattern) => pattern.test(path))) {
+    return res.status(403).json({ message: "Compte actionnaire : consultation uniquement", error: "Compte actionnaire : consultation uniquement" });
+  }
+
+  // Everything that runs for the rest of this request sees the caller's
+  // region scope (Entry/Expense/Product queries are filtered by it).
+  req.regionScope = userRegionScope(user);
+  return runWithRegionScope(req.regionScope, next);
 }
 
 module.exports = authMiddleware;

@@ -33,7 +33,9 @@ function stripCostFieldsFromList(sales, user) {
   return sales.map((sale) => stripCostFields(sale, user));
 }
 
-const EDITABLE_TYPES = ["sale", "reservation"];
+// Only sales can be edited (a historical reservation record stays a
+// reservation; the reservation module itself has been retired).
+const EDITABLE_TYPES = ["sale"];
 
 // Decides whether `user` may edit `originalSale` with the requested `type`.
 // Returns null when allowed, or { status, error }.
@@ -52,27 +54,11 @@ function saleEditDenial(user, originalSale, requestedType) {
     return null;
   }
 
-  // Sales and reservations can never be turned into expenses (that path
-  // rewrote the total without returning stock).
   if (requestedType !== undefined && requestedType !== null && requestedType !== "" &&
-      !EDITABLE_TYPES.includes(requestedType)) {
+      requestedType !== originalSale.type && !EDITABLE_TYPES.includes(requestedType)) {
     return { status: 400, error: "Invalid sale type" };
   }
 
-  if (originalSale.type === "reservation") {
-    if (originalSale.status === "completed" && role !== "admin") {
-      return { status: 403, error: "Only admin can edit completed reservations" };
-    }
-    if (originalSale.status === "pending" && role !== "admin" && role !== "manager") {
-      return { status: 403, error: "Only admin and manager can edit pending reservations" };
-    }
-    if (originalSale.status !== "completed" && originalSale.status !== "pending" && role !== "admin") {
-      return { status: 403, error: "Only admin can edit this reservation" };
-    }
-    return null;
-  }
-
-  // Completed sales: admin only.
   if (role !== "admin") {
     return { status: 403, error: "Only admin can edit completed sales" };
   }

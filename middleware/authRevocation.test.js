@@ -56,10 +56,26 @@ test("token revocation: a token with the current tokenVersion is accepted", asyn
   assert.equal(nextCalled, true);
 });
 
-test("token revocation: legacy tokens without tv still work for legacy users (no forced logout)", async () => {
-  const token = jwt.sign({ id: USER_ID }, process.env.JWT_SECRET);
+const ACCESS_OPTS = { issuer: "boutique-erp", audience: "boutique-erp-app", expiresIn: 900 };
+
+test("token revocation: a user without tokenVersion still works with a fresh access token", async () => {
+  const token = generateToken({ _id: USER_ID });
   const { nextCalled } = await runAuth(token, {});
   assert.equal(nextCalled, true);
+});
+
+test("old long-lived tokens (no typ/issuer/audience) are refused", async () => {
+  const legacy = jwt.sign({ id: USER_ID, tv: 0 }, process.env.JWT_SECRET, { expiresIn: "1d" });
+  const { res, nextCalled } = await runAuth(legacy, {});
+  assert.equal(nextCalled, false);
+  assert.equal(res.statusCode, 401);
+  assert.equal(res.body.code, "TOKEN_INVALID");
+});
+
+test("a correctly signed token of another type is refused", async () => {
+  const refreshLike = jwt.sign({ id: USER_ID, tv: 0, typ: "refresh" }, process.env.JWT_SECRET, ACCESS_OPTS);
+  const { res } = await runAuth(refreshLike, {});
+  assert.equal(res.statusCode, 401);
 });
 
 test("a deactivated user's unexpired token is 401", async () => {
@@ -69,7 +85,7 @@ test("a deactivated user's unexpired token is 401", async () => {
 });
 
 test("the role comes from the database, not from the token payload", async () => {
-  const token = jwt.sign({ id: USER_ID, role: "admin" }, process.env.JWT_SECRET);
+  const token = jwt.sign({ id: USER_ID, role: "admin", typ: "access" }, process.env.JWT_SECRET, ACCESS_OPTS);
   const { req } = await runAuth(token, { role: "staff" });
   assert.equal(req.user.role, "staff");
   assert.equal(req.user.isAdmin, false);
@@ -86,27 +102,30 @@ test("a token signed with another secret, or unsigned, is 401", async () => {
 
 test("an expired token is 401", async () => {
   const expired = jwt.sign(
-    { id: USER_ID },
+    { id: USER_ID, typ: "access" },
     process.env.JWT_SECRET,
-    { expiresIn: -1, algorithm: "HS256" }
+    { ...ACCESS_OPTS, expiresIn: -1, algorithm: "HS256" }
   );
   const { res, nextCalled } = await runAuth(expired, {});
   assert.equal(nextCalled, false);
   assert.equal(res.statusCode, 401);
+  // The client recognises this code and renews silently instead of logging out.
+  assert.equal(res.body.code, "TOKEN_EXPIRED");
 });
 
 test("a token whose id is not an ObjectId is 401 without a database lookup", async () => {
-  const token = jwt.sign({ id: { $ne: null } }, process.env.JWT_SECRET);
+  const token = jwt.sign({ id: { $ne: null }, typ: "access" }, process.env.JWT_SECRET, ACCESS_OPTS);
   const { res } = await runAuth(token, {});
   assert.equal(res.statusCode, 401);
 });
 
-test("generateToken: expiry is set and the payload carries only id + tv", () => {
+test("generateToken: 15-minute expiry and the payload carries only id + tv + typ", () => {
   const token = generateToken({ _id: USER_ID, tokenVersion: 3, role: "admin", password: "x" });
   const decoded = jwt.verify(token, process.env.JWT_SECRET);
   assert.equal(decoded.id, USER_ID);
   assert.equal(decoded.tv, 3);
   assert.equal(decoded.role, undefined);
   assert.equal(decoded.password, undefined);
-  assert.equal(decoded.exp - decoded.iat, 24 * 60 * 60);
+  assert.equal(decoded.typ, "access");
+  assert.equal(decoded.exp - decoded.iat, 15 * 60);
 });

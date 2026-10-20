@@ -15,9 +15,14 @@ router.param("id", (req, res, next, id) => {
   next();
 });
 
-// Cost prices are only for roles that manage products.
+// Cost prices are only for roles that manage products (never shareholders,
+// who consult the catalogue read-only).
+function canSeeProductCosts(user) {
+  return hasModuleAccess(user, "products") && user?.role !== "shareholder";
+}
+
 function productForUser(product, user) {
-  if (!product || hasModuleAccess(user, "products")) return product;
+  if (!product || canSeeProductCosts(user)) return product;
   const plain = typeof product.toObject === "function" ? product.toObject() : { ...product };
   delete plain.unitCost;
   return plain;
@@ -69,7 +74,7 @@ router.get("/", authMiddleware, async (req, res) => {
       filter.regionCode = region;
     }
 
-    const projection = hasModuleAccess(req.user, "products") ? {} : { unitCost: 0 };
+    const projection = canSeeProductCosts(req.user) ? {} : { unitCost: 0 };
     const products = await Product.find(filter, projection).sort({ createdAt: -1 });
     res.json(products);
   } catch (error) {

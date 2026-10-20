@@ -16,6 +16,25 @@ const { buildTimeframeFilter, getTimeframeDescription, getTodayKisangani } = rep
 const { scopedRevenueExpression, buildPagedFacet } = require("../utils/reportingPipelines");
 const { MutationError, IdempotentReplay, createSaleTransaction, validateClientOccurredAt, salePayloadMatches } = require("../utils/saleCreation");
 const { isValidBarcodeToken, isMatchingReceiptIdentity } = require("../utils/barcodeId");
+const { canonicalSaleCode, saleCodeSearchSource } = require("../utils/saleCode");
+const { SALE_RECORD_TYPES } = require("../utils/reportingPipelines");
+const { resolveRegion, saleInRegion, saleRegionFilter, projectSaleForScope } = require("../utils/regionScope");
+
+// The region a request may see: the caller's own region when the account is
+// region-scoped (asking for the other one is refused), otherwise the filter
+// they chose. Sends the error response itself and returns null on refusal.
+function requestRegion(req, res) {
+  try {
+    return resolveRegion(req.user, req.query.region);
+  } catch (error) {
+    res.status(error.status || 400).json({ error: error.message });
+    return null;
+  }
+}
+
+// A region-scoped viewer sees only their region's lines of a mixed sale.
+const scopeList = (rows, req) => (req.regionScope ? rows.map((row) => projectSaleForScope(row, req.regionScope)) : rows);
+const OUT_OF_SCOPE = "Accès limité à votre région";
 const SaleSyncConflict = require("../models/SaleSyncConflict");
 const User = require("../models/User");
 const { isObjectId, saleItemError, saleChargesError, toFiniteNumber, toPositiveAmount, cleanString } = require("../utils/validate");
@@ -101,7 +120,7 @@ async function recalculateCustomerStats(customerId, session = null) {
     { $match: {
       customerId: new mongoose.Types.ObjectId(customerId),
       status: { $in: ["completed", "pending", null] },
-      type: { $in: ["sale", "reservation"] },
+      type: { $in: [...SALE_RECORD_TYPES] },
     } },
     { $group: {
       _id: null,
@@ -143,7 +162,8 @@ router.get("/offline-snapshot", authMiddleware, requireModulePermission(["sales"
     const rows = await Sale.find({
       ...range,
       status: { $in: ["completed", "pending", null] },
-      type: { $in: ["sale", "reservation"] },
+      type: { $in: [...SALE_RECORD_TYPES] },
+      ...saleRegionFilter(req.regionScope),
     }).sort({ createdAt: 1, _id: 1 }).limit(maxRows + 1).lean();
     if (rows.length > maxRows) {
       return res.status(409).json({
@@ -152,7 +172,7 @@ router.get("/offline-snapshot", authMiddleware, requireModulePermission(["sales"
       });
     }
     return res.json({
-      sales: stripCostFieldsFromList(rows, req.user),
+      sales: stripCostFieldsFromList(scopeList(rows, req), req.user),
       coverage: {
         start: range.createdAt.$gte.toISOString(),
         end: range.createdAt.$lte.toISOString(),
@@ -173,12 +193,14 @@ router.get("/offline-snapshot", authMiddleware, requireModulePermission(["sales"
  */
 router.get("/", authMiddleware, requireModulePermission("sales"), async (req, res) => {
   try {
-    const { customerPhone, customer, status, type, region, paymentMethod, search, edited } = req.query;
+    const { customerPhone, customer, status, type, paymentMethod, search, edited } = req.query;
+    const region = requestRegion(req, res);
+    if (region === null) return;
     const { page, limit, skip } = reportingDate.parsePagination(req.query);
     const timeframeFilter = reportingDate.buildTimeframeFilter(req.query);
     const filter = { ...timeframeFilter };
     filter.status = status || { $in: ["completed", "pending", null] };
-    filter.type = type || { $in: ["sale", "reservation"] };
+    filter.type = type || { $in: [...SALE_RECORD_TYPES] };
     if (customerPhone) filter["customer.phone"] = customerPhone;
     if (paymentMethod) filter.paymentMethod = paymentMethod;
 
@@ -193,8 +215,11 @@ router.get("/", authMiddleware, requireModulePermission("sales"), async (req, re
     const term = String(search || customer || "").trim().slice(0, 100);
     if (term) {
       const escaped = term.replace(/[|\\{}()[\]^$+*?.-]/g, "\\$&");
-      const criteria = ["saleId", "saleNumber", "customer.name", "customer.phone", "salesPerson"]
+      const criteria = ["saleId", "saleNumber", "saleCode", "receiptNumber", "customer.name", "customer.phone", "salesPerson"]
         .map((field) => ({ [field]: { $regex: escaped, $options: "i" } }));
+      // Receipt codes are found even when typed without dashes (V261020K7QM3).
+      const codeSource = saleCodeSearchSource(term);
+      if (codeSource) criteria.push({ saleCode: { $regex: codeSource, $options: "i" } });
       if (mongoose.isValidObjectId(term)) criteria.push({ customerId: new mongoose.Types.ObjectId(term) });
       andFilters.push({ $or: criteria });
     }
@@ -218,7 +243,7 @@ router.get("/", authMiddleware, requireModulePermission("sales"), async (req, re
       } }),
     ]).allowDiskUse(true);
 
-    const sales = stripCostFieldsFromList(await resolveLegacyItemRegions(facet.data || []), req.user);
+    const sales = stripCostFieldsFromList(scopeList(await resolveLegacyItemRegions(facet.data || []), req), req.user);
     const total = facet.metadata?.[0]?.totalRecords || 0;
     const totals = facet.summary?.[0] || {
       totalRevenue: 0, totalExpenses: 0, saleCount: 0, expenseCount: 0,
@@ -245,7 +270,7 @@ router.get("/", authMiddleware, requireModulePermission("sales"), async (req, re
       filtersApplied: {
         customerPhone: customerPhone || "none",
         status: status || "default (completed, pending, legacy-unset)",
-        type: type || "default (sale, reservation)",
+        type: type || "default (sales)",
         paymentMethod: paymentMethod || "none",
         search: term || "none",
         edited: edited === "true",
@@ -273,13 +298,14 @@ router.get("/stats/daily", authMiddleware, requireModulePermission("sales"), asy
       { $match: {
         ...dateFilter,
         status: { $in: ["completed", "pending", null] },
-        type: { $in: ["sale", "reservation"] },
+        type: { $in: [...SALE_RECORD_TYPES] },
+        ...saleRegionFilter(req.regionScope),
       } },
       { $facet: {
         summary: [{ $group: {
           _id: null,
           totalSales: { $sum: 1 },
-          totalRevenue: { $sum: "$total" },
+          totalRevenue: { $sum: scopedRevenueExpression(req.regionScope) },
           totalItems: { $sum: { $size: { $ifNull: ["$items", []] } } },
         } }],
         sales: [{ $sort: { createdAt: -1, _id: -1 } }, { $skip: skip }, { $limit: limit }, { $project: { __v: 0 } }],
@@ -289,7 +315,7 @@ router.get("/stats/daily", authMiddleware, requireModulePermission("sales"), asy
     res.json({
       date: dateStr,
       ...summary,
-      sales: stripCostFieldsFromList(facet.sales || [], req.user),
+      sales: stripCostFieldsFromList(scopeList(facet.sales || [], req), req.user),
       pagination: { totalRecords: summary.totalSales, totalPages: Math.ceil(summary.totalSales / limit), currentPage: page, limit },
     });
   } catch (error) {
@@ -299,15 +325,13 @@ router.get("/stats/daily", authMiddleware, requireModulePermission("sales"), asy
 });
 
 /** ---------- CREATE SALE OR EXPENSE ---------- **/
-router.post("/", authMiddleware, requireModulePermission(["pos", "reservation"]), async (req, res) => {
+router.post("/", authMiddleware, requireModulePermission("pos"), async (req, res) => {
   try {
     const {
       customer,
       items,
       paymentMethod,
       type,
-      reservationDate,
-      reservationTime,
       notes,
       exchangeRateSnapshot,
       discount,
@@ -327,7 +351,8 @@ router.post("/", authMiddleware, requireModulePermission(["pos", "reservation"])
 
     const normalizedPM = normalizePaymentMethod(paymentMethod);
 
-    if (type !== undefined && type !== null && type !== "" && !["sale", "reservation", "expense"].includes(type)) {
+    // The reservation module has been retired: only sales can be created.
+    if (type !== undefined && type !== null && type !== "" && !["sale", "expense"].includes(type)) {
       return res.status(400).json({ error: "Invalid sale type" });
     }
     if (clientSaleId !== undefined && clientSaleId !== null && (typeof clientSaleId !== "string" || clientSaleId.length > 100)) {
@@ -415,9 +440,6 @@ router.post("/", authMiddleware, requireModulePermission(["pos", "reservation"])
       safeCustomer,
       salesPerson: req.user.username,
       paymentMethod: normalizedPM,
-      type,
-      reservationDate,
-      reservationTime,
       notes,
       exchangeRateSnapshot,
       discount,
@@ -444,7 +466,7 @@ router.post("/", authMiddleware, requireModulePermission(["pos", "reservation"])
 });
 
 /** ---------- OFFLINE SALE SYNC (idempotent intake for the designated offline device) ---------- **/
-router.post("/sync", authMiddleware, requireModulePermission(["pos", "reservation"]), async (req, res) => {
+router.post("/sync", authMiddleware, requireModulePermission("pos"), async (req, res) => {
   try {
     const {
       customer,
@@ -452,8 +474,6 @@ router.post("/sync", authMiddleware, requireModulePermission(["pos", "reservatio
       paymentMethod,
       salesPerson,
       type,
-      reservationDate,
-      reservationTime,
       notes,
       exchangeRateSnapshot,
       discount,
@@ -470,7 +490,7 @@ router.post("/sync", authMiddleware, requireModulePermission(["pos", "reservatio
     if (!clientSaleId || typeof clientSaleId !== "string" || clientSaleId.length > 100) {
       return res.status(400).json({ error: "clientSaleId is required for offline sync" });
     }
-    if (type !== undefined && type !== null && type !== "" && !["sale", "reservation"].includes(type)) {
+    if (type !== undefined && type !== null && type !== "" && type !== "sale") {
       return res.status(400).json({ error: "Invalid sale type" });
     }
     if (!isValidBarcodeToken(barcodeToken)) {
@@ -510,9 +530,6 @@ router.post("/sync", authMiddleware, requireModulePermission(["pos", "reservatio
       safeCustomer,
       salesPerson: syncSalesPerson,
       paymentMethod: normalizedPM,
-      type,
-      reservationDate,
-      reservationTime,
       notes,
       exchangeRateSnapshot,
       discount,
@@ -549,20 +566,26 @@ router.post("/sync", authMiddleware, requireModulePermission(["pos", "reservatio
 });
 
 /** ---------- BARCODE LOOKUP (receipt/stub scanning) ---------- **/
-router.get("/barcode/:token", authMiddleware, requireModulePermission(["pos", "sales", "reservation"]), async (req, res) => {
+router.get("/barcode/:token", authMiddleware, requireModulePermission(["pos", "sales"]), async (req, res) => {
   try {
-    const { token } = req.params;
-    if (!isValidBarcodeToken(token)) {
-      return res.status(400).json({ found: false, error: "Malformed barcode" });
+    // Accepts an old receipt's barcode token or a printed sale code
+    // (V-261020-K7QM3, with or without dashes).
+    const raw = String(req.params.token || "").trim().toUpperCase();
+    const code = canonicalSaleCode(raw);
+    const token = raw.replace(/-/g, "");
+    if (!code && !isValidBarcodeToken(token)) {
+      return res.status(400).json({ found: false, error: "Malformed receipt code" });
     }
-    const sale = await Sale.findOne({ barcodeToken: token }).lean();
-    if (!sale) return res.status(200).json({ found: false });
+    const found = await Sale.findOne(code ? { saleCode: code } : { barcodeToken: token }).lean();
+    if (!found || !saleInRegion(found, req.regionScope, "any")) return res.status(200).json({ found: false });
+    const sale = projectSaleForScope(found, req.regionScope);
 
     const itemCount = (sale.items || []).reduce((sum, item) => sum + (Number(item.quantity) || 0), 0);
     const rate = sale.exchangeRateSnapshot?.rate;
     return res.status(200).json({
       found: true,
-      receiptNumber: sale.receiptNumber || sale.saleId,
+      receiptNumber: sale.saleCode || sale.receiptNumber || sale.saleId,
+      saleCode: sale.saleCode || null,
       occurredAt: sale.createdAt,
       customerName: sale.customer?.isWalkIn ? "Walk-in Customer" : sale.customer?.name || "Walk-in Customer",
       totalUSD: sale.total,
@@ -580,7 +603,7 @@ router.get("/barcode/:token", authMiddleware, requireModulePermission(["pos", "s
 });
 
 /** ---------- SYNC CONFLICT REPORTING / RECONCILIATION ---------- **/
-router.post("/sync/conflicts", authMiddleware, requireModulePermission(["pos", "reservation"]), async (req, res) => {
+router.post("/sync/conflicts", authMiddleware, requireModulePermission("pos"), async (req, res) => {
   try {
     const {
       clientSaleId, barcodeToken, receiptNumber, reason,
@@ -670,7 +693,9 @@ router.get("/expenses/all", authMiddleware, requireModulePermission("sortiehisto
     
     const filter = { 
       type: "expense",
-      ...timeframeFilter
+      ...timeframeFilter,
+      // Legacy expense rows carry no region: region-scoped accounts never see them.
+      ...(req.regionScope && { _id: { $exists: false } }),
     };
     
     if (status) {
@@ -704,68 +729,6 @@ router.get("/expenses/all", authMiddleware, requireModulePermission("sortiehisto
   }
 });
 
-/** ---------- GET RESERVATIONS (TIME FRAME BASED) ---------- **/
-router.get("/reservations/all", authMiddleware, requireModulePermission("reservations"), async (req, res) => {
-  try {
-    const { status, region, search } = req.query;
-    const { page, limit, skip } = reportingDate.parsePagination(req.query);
-    const timeframeFilter = reportingDate.buildTimeframeFilter(req.query);
-    const filter = {
-      type: "reservation",
-      status: status && status !== "all" ? status : { $in: ["pending", "completed", null] },
-      ...timeframeFilter,
-    };
-    if (region) {
-      if (!VALID_REGION_CODES.includes(region)) return res.status(400).json({ error: "Invalid region code" });
-      filter.$or = [
-        { "items.regionCode": region },
-        { "items.region": region === "Bbbb" ? "Butembo" : "China" },
-      ];
-    }
-    if (search) {
-      const escaped = String(search).replace(/[|\\{}()[\]^$+*?.-]/g, "\\$&");
-      const searchFilter = { $or: [
-        { saleId: { $regex: escaped, $options: "i" } },
-        { "customer.name": { $regex: escaped, $options: "i" } },
-        { "customer.phone": { $regex: escaped, $options: "i" } },
-        { "customer.email": { $regex: escaped, $options: "i" } },
-      ] };
-      filter.$and = [...(filter.$or ? [{ $or: filter.$or }] : []), searchFilter];
-      delete filter.$or;
-    }
-
-    const revenue = scopedRevenueExpression(region);
-    const [facet = {}] = await Sale.aggregate([
-      { $match: filter },
-      buildPagedFacet({ skip, limit, summaryGroup: {
-        _id: null,
-        totalReservations: { $sum: 1 },
-        pending: { $sum: { $cond: [{ $eq: ["$status", "pending"] }, 1, 0] } },
-        completed: { $sum: { $cond: [{ $eq: ["$status", "completed"] }, 1, 0] } },
-        totalValue: { $sum: revenue },
-        itemCount: { $sum: { $size: { $ifNull: ["$items", []] } } },
-      } }),
-    ]).allowDiskUse(true);
-    const data = stripCostFieldsFromList(await resolveLegacyItemRegions(facet.data || []), req.user);
-    const total = facet.metadata?.[0]?.totalRecords || 0;
-    const summary = facet.summary?.[0] || {
-      totalReservations: 0, pending: 0, completed: 0, totalValue: 0, itemCount: 0,
-    };
-    res.json({
-      success: true,
-      data,
-      pagination: { totalRecords: total, totalPages: Math.ceil(total / limit), currentPage: page, limit },
-      summary: { ...summary, timeframe: getTimeframeDescription(req.query) },
-    });
-  } catch (error) {
-    console.error("Error fetching reservations:", error);
-    res.status(/Invalid date|Invalid year|Invalid month|Start date/.test(error.message) ? 400 : 500)
-      .json({ error: /Invalid/.test(error.message) ? error.message : "Failed to fetch reservations" });
-  }
-});
-
-// ==================== ALL OTHER ROUTES REMAIN EXACTLY THE SAME ====================
-
 /** ---------- GET BY ID (after other specific routes) ---------- **/
 router.get("/:id", authMiddleware, requireModulePermission("sales"), async (req, res) => {
   try {
@@ -775,7 +738,7 @@ router.get("/:id", authMiddleware, requireModulePermission("sales"), async (req,
       .select('-__v') // Exclude version key
       .lean();
     
-    if (!sale) {
+    if (!sale || !saleInRegion(sale, req.regionScope, "any")) {
       return res.status(404).json({ error: "Sale not found" });
     }
 
@@ -796,7 +759,7 @@ router.get("/:id", authMiddleware, requireModulePermission("sales"), async (req,
 
     res.json({
       success: true,
-      data: stripCostFields(sale, req.user),
+      data: stripCostFields(projectSaleForScope(sale, req.regionScope), req.user),
       duplicates: {
         count: duplicateCount,
         items: potentialDuplicates
@@ -825,8 +788,6 @@ router.put("/:id", authMiddleware, requireModulePermission("sales"), async (req,
       paymentMethod, 
       reason, 
       type, 
-      reservationDate, 
-      reservationTime, 
       notes,
       // Expense fields
       recipientName,
@@ -843,10 +804,14 @@ router.put("/:id", authMiddleware, requireModulePermission("sales"), async (req,
     if (!originalSale) {
       return res.status(404).json({ error: "Sale not found" });
     }
+    // Changing a sale requires every one of its lines to be in the caller's region.
+    if (!saleInRegion(originalSale, req.regionScope, "all")) {
+      return res.status(403).json({ error: OUT_OF_SCOPE });
+    }
 
-    // Role rules: completed sales are admin-only; reservations keep their
-    // existing admin/manager rules; a sale can never be turned into an
-    // expense (that rewrote the total without returning stock).
+    // Role rules: sales (including historical reservation records) are
+    // admin-only; a sale can never be turned into an expense (that rewrote
+    // the total without returning stock).
     const denial = saleEditDenial(req.user, originalSale, type);
     if (denial) {
       return res.status(denial.status).json({ error: denial.error });
@@ -1027,8 +992,6 @@ router.put("/:id", authMiddleware, requireModulePermission("sales"), async (req,
             profit: total - allocatedItems.reduce((sum, item) => sum + item.cost, 0),
             paymentMethod: normalizedPM,
             type: effectiveType,
-            reservationDate: typeof reservationDate === "string" && reservationDate ? reservationDate.slice(0, 40) : originalSale.reservationDate,
-            reservationTime: typeof reservationTime === "string" && reservationTime ? reservationTime.slice(0, 40) : originalSale.reservationTime,
             notes: typeof notes === "string" && notes ? notes.slice(0, 1000) : originalSale.notes,
             editedBy: req.user.userId,
             editedAt: new Date(),
@@ -1075,84 +1038,6 @@ router.put("/:id", authMiddleware, requireModulePermission("sales"), async (req,
   }
 });
 
-/** ---------- MARK RESERVATION AS COMPLETED ---------- **/
-router.patch("/:id/complete", authMiddleware, requireModulePermission("sales"), async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    const sale = await Sale.findById(id).lean();
-    if (!sale) {
-      return res.status(404).json({ error: "Réservation non trouvée" });
-    }
-
-    // 🔹 NEW: Check if it's actually a reservation
-    if (sale.type !== "reservation") {
-      return res.status(400).json({ error: "This is not a reservation" });
-    }
-
-    // 🔹 NEW: Check if already completed
-    if (sale.status === "completed") {
-      return res.status(400).json({ error: "Reservation already completed" });
-    }
-
-    const updatedSale = await Sale.findByIdAndUpdate(
-      id,
-      {
-        status: "completed",
-        completedAt: new Date(),
-        completedBy: req.user.username || req.user.userId,
-      },
-      { new: true }
-    );
-    await audit(req, "reservation.completed", { targetType: "Sale", targetId: id, before: { status: sale.status } });
-
-    res.json(stripCostFields(updatedSale, req.user));
-  } catch (error) {
-    console.error("Error completing reservation:", error);
-    res.status(500).json({ error: "Échec de la mise à jour de la réservation" });
-  }
-});
-
-/** ---------- MARK RESERVATION AS PENDING ---------- **/
-router.patch("/:id/pending", authMiddleware, requireModulePermission("sales"), async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    const sale = await Sale.findById(id).lean();
-    if (!sale) {
-      return res.status(404).json({ error: "Réservation non trouvée" });
-    }
-
-    // 🔹 NEW: RESTRICTION - Only admin can return completed reservations to pending
-    if (sale.status === "completed" && req.user.role !== "admin") {
-      return res.status(403).json({ 
-        error: "Only admin can return completed reservations to pending" 
-      });
-    }
-
-    // 🔹 NEW: Check if it's actually a reservation
-    if (sale.type !== "reservation") {
-      return res.status(400).json({ error: "This is not a reservation" });
-    }
-
-    const updatedSale = await Sale.findByIdAndUpdate(
-      id,
-      {
-        status: "pending",
-        completedAt: null,
-        completedBy: null,
-      },
-      { new: true }
-    );
-    await audit(req, "reservation.reopened", { targetType: "Sale", targetId: id, before: { status: sale.status, completedBy: sale.completedBy } });
-
-    res.json(stripCostFields(updatedSale, req.user));
-  } catch (error) {
-    console.error("Error setting reservation to pending:", error);
-    res.status(500).json({ error: "Échec de la mise à jour de la réservation" });
-  }
-});
-
 /** ---------- VOID/REFUND SALE ---------- **/
 router.patch("/:id/void", authMiddleware, requireModulePermission("sales"), async (req, res) => {
   const session = await mongoose.startSession();
@@ -1171,10 +1056,11 @@ router.patch("/:id/void", authMiddleware, requireModulePermission("sales"), asyn
       stockWarnings = [];
       const sale = await Sale.findById(id).session(session).lean();
       if (!sale) throw new MutationError(404, "Sale not found");
+      if (!saleInRegion(sale, req.regionScope, "all")) throw new MutationError(403, OUT_OF_SCOPE);
       if (sale.status === "voided") throw new MutationError(400, "Sale is already voided");
       saleBeforeVoid = sale;
 
-      if (["sale", "reservation"].includes(sale.type)) {
+      if (SALE_RECORD_TYPES.includes(sale.type)) {
         for (const [productId, quantity] of aggregateItemQuantities(sale.items)) {
           const product = await Product.findByIdAndUpdate(
             productId, { $inc: { stock: quantity } }, { new: true, session }
@@ -1199,7 +1085,7 @@ router.patch("/:id/void", authMiddleware, requireModulePermission("sales"), asyn
         },
         { new: true, session }
       );
-      if (sale.customerId && ["sale", "reservation"].includes(sale.type)) {
+      if (sale.customerId && SALE_RECORD_TYPES.includes(sale.type)) {
         await recalculateCustomerStats(sale.customerId, session);
       }
     });
@@ -1238,9 +1124,10 @@ router.delete("/:id", authMiddleware, requireModulePermission("sales"), async (r
       stockWarnings = [];
       const sale = await Sale.findById(req.params.id).session(session).lean();
       if (!sale) throw new MutationError(404, "Sale not found");
+      if (!saleInRegion(sale, req.regionScope, "all")) throw new MutationError(403, OUT_OF_SCOPE);
       deletedSale = sale;
 
-      if (["sale", "reservation"].includes(sale.type) && sale.status !== "voided") {
+      if (SALE_RECORD_TYPES.includes(sale.type) && sale.status !== "voided") {
         for (const [productId, quantity] of aggregateItemQuantities(sale.items)) {
           const product = await Product.findByIdAndUpdate(
             productId, { $inc: { stock: quantity } }, { new: true, session }
@@ -1249,7 +1136,7 @@ router.delete("/:id", authMiddleware, requireModulePermission("sales"), async (r
         }
       }
       await Sale.deleteOne({ _id: sale._id }, { session });
-      if (sale.customerId && ["sale", "reservation"].includes(sale.type)) {
+      if (sale.customerId && SALE_RECORD_TYPES.includes(sale.type)) {
         await recalculateCustomerStats(sale.customerId, session);
       }
     });
@@ -1258,7 +1145,7 @@ router.delete("/:id", authMiddleware, requireModulePermission("sales"), async (r
     res.json({ 
       success: true,
       message: "Sale deleted successfully",
-      stockReturned: ["sale", "reservation"].includes(deletedSale.type) &&
+      stockReturned: SALE_RECORD_TYPES.includes(deletedSale.type) &&
         deletedSale.status !== "voided" && stockWarnings.length === 0,
       stockWarnings,
     });

@@ -1,6 +1,6 @@
-const { MODULE_IDS, defaultModulesForRole } = require("../config/modulePermissions");
+const { MODULE_IDS, SHAREHOLDER_MODULES, defaultModulesForRole } = require("../config/modulePermissions");
 
-const ROLE_ENUM = ["admin", "manager", "inventory_manager", "cashier_supervisor", "staff"];
+const ROLE_ENUM = ["admin", "manager", "inventory_manager", "cashier_supervisor", "staff", "shareholder"];
 
 // A user can only ever use the app when both flags agree it's allowed.
 // `isActive` is the field pre-existing code already relies on (and is kept in
@@ -24,6 +24,12 @@ function statusDenialMessage(user) {
 function getEffectiveModules(user) {
   if (!user) return [];
   if (user.role === "admin") return MODULE_IDS;
+  // Shareholders can never be given an operational module, even by a
+  // customized permission list.
+  if (user.role === "shareholder") {
+    const chosen = Array.isArray(user.modulePermissions) ? user.modulePermissions : defaultModulesForRole("shareholder");
+    return chosen.filter((id) => SHAREHOLDER_MODULES.includes(id));
+  }
   if (Array.isArray(user.modulePermissions)) {
     return user.modulePermissions.includes("pos") && !user.modulePermissions.includes("sync")
       ? [...user.modulePermissions, "sync"]
@@ -38,12 +44,6 @@ function hasModuleAccess(user, moduleId) {
   return ids.some((id) => effective.includes(id));
 }
 
-// Registration must never let the caller choose role/status/permissions.
-function sanitizeRegistrationInput(body) {
-  const { username, email, password } = body || {};
-  return { username, email, password };
-}
-
 module.exports = {
   ROLE_ENUM,
   MODULE_IDS,
@@ -51,5 +51,4 @@ module.exports = {
   statusDenialMessage,
   getEffectiveModules,
   hasModuleAccess,
-  sanitizeRegistrationInput,
 };

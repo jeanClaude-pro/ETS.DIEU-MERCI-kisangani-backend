@@ -1,4 +1,5 @@
 const express = require("express");
+const { SALE_RECORD_TYPES } = require("../utils/reportingPipelines");
 const router = express.Router();
 const Customer = require("../models/Customer");
 const Sale = require("../models/Sale"); // Make sure to import Sale model
@@ -12,17 +13,13 @@ const { isObjectId, cleanString, capLimit } = require("../utils/validate");
 const { audit } = require("../utils/audit");
 
 router.use(authMiddleware);
-router.use(requireModulePermission("customers"));
 
-// Reject malformed ids before any database call.
-router.param("id", (req, res, next, id) => {
-  if (!isObjectId(id)) return res.status(400).json({ error: "Invalid customer ID" });
-  next();
-});
-
+// GET /api/customers/walkin — needed by the POS (cashiers without the
+// customers module still sell to the walk-in customer), so it is declared
+// before the customers-only gate below.
 // GET /api/customers/walkin - Get the permanent system Walk-in Customer
 // (created lazily here as a fallback in case the startup bootstrap hasn't run)
-router.get("/walkin", async (req, res) => {
+router.get("/walkin", requireModulePermission(["pos", "customers"]), async (req, res) => {
   try {
     const customer = await ensureWalkInCustomer();
     res.json(customer);
@@ -30,6 +27,14 @@ router.get("/walkin", async (req, res) => {
     console.error("Error fetching walk-in customer:", error);
     res.status(500).json({ error: "Failed to fetch walk-in customer" });
   }
+});
+
+router.use(requireModulePermission("customers"));
+
+// Reject malformed ids before any database call.
+router.param("id", (req, res, next, id) => {
+  if (!isObjectId(id)) return res.status(400).json({ error: "Invalid customer ID" });
+  next();
 });
 
 // GET /api/customers - Get all customers with optional filtering
@@ -196,7 +201,7 @@ router.post("/:id/recalculate", async (req, res) => {
       { $match: {
         customerId: new mongoose.Types.ObjectId(customerId),
         status: { $in: ["completed", "pending", null] },
-        type: { $in: ["sale", "reservation"] },
+        type: { $in: [...SALE_RECORD_TYPES] },
       } },
       { $group: {
         _id: null,

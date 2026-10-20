@@ -3,7 +3,6 @@ const assert = require("node:assert/strict");
 const {
   isAccountUsable,
   getEffectiveModules,
-  sanitizeRegistrationInput,
   MODULE_IDS,
 } = require("./userAccess");
 
@@ -43,23 +42,10 @@ test("getEffectiveModules: explicit POS access includes its synchronization safe
   assert.deepEqual(getEffectiveModules({ role: "staff", modulePermissions: [] }), []);
 });
 
-test("sanitizeRegistrationInput: strips role/status/isActive/modulePermissions from client input", () => {
-  const result = sanitizeRegistrationInput({
-    username: "bob",
-    email: "bob@example.com",
-    password: "secret123",
-    role: "admin",
-    status: "active",
-    isActive: true,
-    modulePermissions: ["management"],
-  });
-  assert.deepEqual(result, { username: "bob", email: "bob@example.com", password: "secret123" });
-});
-
 test("module id registry has the expected known ids (drift guard)", () => {
   const expected = [
-    "dashboard", "rate", "pos", "reservation", "entry", "sortie", "products",
-    "sales", "scanner", "reservations", "entryhistory", "sortiehistory", "reports",
+    "dashboard", "rate", "pos", "entry", "sortie", "products",
+    "sales", "scanner", "entryhistory", "sortiehistory", "reports",
     "customers", "management", "sync",
   ];
   assert.deepEqual([...MODULE_IDS].sort(), [...expected].sort());

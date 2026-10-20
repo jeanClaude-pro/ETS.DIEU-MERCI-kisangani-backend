@@ -1,7 +1,12 @@
 const { KISANGANI_TIMEZONE } = require("./reportingDate");
 
+// "reservation" records were created by the retired reservation module.
+// They stay part of sales history and revenue so past totals never change;
+// no new ones can be created.
+const SALE_RECORD_TYPES = ["sale", "reservation"];
+
 const REPORTABLE_SALE_MATCH = {
-  type: { $in: ["sale", "reservation"] },
+  type: { $in: SALE_RECORD_TYPES },
   status: { $in: ["completed", "pending", null] },
 };
 
@@ -89,6 +94,7 @@ function dateGroup(format) {
 }
 
 module.exports = {
+  SALE_RECORD_TYPES,
   REPORTABLE_SALE_MATCH,
   itemSubtotal,
   itemRegion,

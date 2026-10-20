@@ -8,6 +8,7 @@ const {
 } = require("./saleIntegrity");
 const { aggregateItemQuantities } = require("./saleMutations");
 const { generateBarcodeToken, formatReceiptNumber } = require("./barcodeId");
+const { saleCodeFor } = require("./saleCode");
 const { saleItemError, saleChargesError, toFiniteNumber } = require("./validate");
 
 class MutationError extends Error {
@@ -134,9 +135,6 @@ async function createSaleTransaction({
   safeCustomer,
   salesPerson,
   paymentMethod,
-  type,
-  reservationDate,
-  reservationTime,
   notes,
   exchangeRateSnapshot,
   discount,
@@ -192,8 +190,13 @@ async function createSaleTransaction({
     ? identity
     : await generateUniqueIdentity();
 
+  // One timestamp for both createdAt and the printed sale code, so a sale
+  // made a millisecond before midnight cannot get tomorrow's date in its code.
+  const createdAt = createdAtOverride || new Date();
+
   const saleData = {
     saleId: legacySaleId(),
+    saleCode: saleCodeFor({ type: "sale", occurredAt: createdAt, barcodeToken: resolvedIdentity.barcodeToken }),
     saleNumber: legacySaleNumber(),
     barcodeToken: resolvedIdentity.barcodeToken,
     receiptNumber: resolvedIdentity.receiptNumber,
@@ -207,11 +210,9 @@ async function createSaleTransaction({
     cost: allocatedItems.reduce((sum, item) => sum + item.cost, 0),
     profit: total - allocatedItems.reduce((sum, item) => sum + item.cost, 0),
     paymentMethod,
-    status: type === "reservation" ? "pending" : "completed",
+    status: "completed",
     salesPerson: salesPerson || "Admin",
-    type: type === "reservation" ? "reservation" : "sale",
-    reservationDate: typeof reservationDate === "string" ? reservationDate.slice(0, 40) : null,
-    reservationTime: typeof reservationTime === "string" ? reservationTime.slice(0, 40) : null,
+    type: "sale",
     notes: typeof notes === "string" ? notes.slice(0, 1000) : "",
     ...(exchangeRateSnapshot && typeof exchangeRateSnapshot === "object" && {
       exchangeRateSnapshot: {
@@ -225,7 +226,7 @@ async function createSaleTransaction({
     // Only the offline-sync path ever supplies this — it preserves the true
     // transaction time instead of the later sync time. Mongoose only
     // auto-populates createdAt when it isn't already present on the doc.
-    ...(createdAtOverride && { createdAt: createdAtOverride }),
+    createdAt,
   };
 
   const session = await mongoose.startSession();
