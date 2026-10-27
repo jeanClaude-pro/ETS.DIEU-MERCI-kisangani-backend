@@ -134,6 +134,9 @@ router.put("/me/password", async (req, res) => {
     if (typeof currentPassword !== "string" || typeof newPassword !== "string") {
       return res.status(400).json({ message: "currentPassword and newPassword are required" });
     }
+    if (!currentPassword || currentPassword.length > 128) {
+      return res.status(400).json({ message: "Current password is invalid" });
+    }
     const policyError = passwordPolicyError(newPassword);
     if (policyError) return res.status(400).json({ message: policyError });
 
@@ -141,6 +144,9 @@ router.put("/me/password", async (req, res) => {
     if (!user) return res.status(404).json({ message: "User not found" });
     if (!(await bcrypt.compare(currentPassword, user.password))) {
       return res.status(400).json({ message: "Current password is incorrect" });
+    }
+    if (currentPassword === newPassword) {
+      return res.status(400).json({ message: "New password must be different from the current password" });
     }
 
     user.password = await bcrypt.hash(newPassword, 10);

@@ -143,6 +143,72 @@ test("users: new passwords must meet the 8-character policy", async () => {
   assert.equal(res.statusCode, 400);
 });
 
+test("users: changing your own password requires the correct current password", async () => {
+  const original = User.findById;
+  const password = await require("bcryptjs").hash("old-password", 4);
+  User.findById = async () => ({ _id: ADMIN_ID, password, tokenVersion: 0, save: async () => {} });
+  try {
+    const res = fakeRes();
+    await routeHandler("put", "/me/password")(
+      { body: { currentPassword: "wrong-password", newPassword: "new-password" }, user: adminUser }, res);
+    assert.equal(res.statusCode, 400);
+    assert.match(res.body.message, /incorrect/i);
+  } finally {
+    User.findById = original;
+  }
+});
+
+test("users: changing your own password rejects password reuse", async () => {
+  const original = User.findById;
+  const password = await require("bcryptjs").hash("same-password", 4);
+  User.findById = async () => ({ _id: ADMIN_ID, password, tokenVersion: 0, save: async () => {} });
+  try {
+    const res = fakeRes();
+    await routeHandler("put", "/me/password")(
+      { body: { currentPassword: "same-password", newPassword: "same-password" }, user: adminUser }, res);
+    assert.equal(res.statusCode, 400);
+    assert.match(res.body.message, /different/i);
+  } finally {
+    User.findById = original;
+  }
+});
+
+test("users: changing your own password hashes it, revokes sessions and audits the change", async () => {
+  const bcrypt = require("bcryptjs");
+  const originalFind = User.findById;
+  const originalCreate = AuditLog.create;
+  const target = {
+    _id: ADMIN_ID,
+    password: await bcrypt.hash("old-password", 4),
+    tokenVersion: 2,
+    saveCalled: false,
+    async save() { this.saveCalled = true; },
+  };
+  const audited = [];
+  User.findById = async () => target;
+  AuditLog.create = async (doc) => { audited.push(doc); return doc; };
+  try {
+    const res = fakeRes();
+    await routeHandler("put", "/me/password")({
+      body: { currentPassword: "old-password", newPassword: "new-password" },
+      user: adminUser,
+      ip: "1.1.1.1",
+      get: () => "test-agent",
+    }, res);
+
+    assert.equal(res.statusCode, null);
+    assert.equal(target.saveCalled, true);
+    assert.equal(target.tokenVersion, 3);
+    assert.equal(await bcrypt.compare("new-password", target.password), true);
+    assert.equal(await bcrypt.compare("old-password", target.password), false);
+    assert.equal(audited[0].action, "user.password_changed");
+    assert.equal(audited[0].targetId, ADMIN_ID);
+  } finally {
+    User.findById = originalFind;
+    AuditLog.create = originalCreate;
+  }
+});
+
 test("users: User JSON never exposes password or tokenVersion", () => {
   const user = new User({ username: "u", email: "u@shop.cd", password: "$2a$hash", tokenVersion: 4 });
   const json = user.toJSON();
